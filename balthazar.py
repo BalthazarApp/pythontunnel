@@ -39,6 +39,7 @@ __all__ = [
     "search_devices",
     "search_objects",
     "new_flow_run",
+    "log_cell_source",
     "Device",
     "info",
     "warn",
@@ -224,6 +225,58 @@ def search_devices(
 search_objects = search_devices
 
 
+log_cell_source = True
+"""Send the notebook cell that created a run into that run's Balthazar logs.
+
+Set ``blt.log_cell_source = False`` to stop shipping your source to the server.
+"""
+
+_MAX_CELL_CHARS = 8000
+_cell_source: Optional[str] = None
+
+
+def _capture_cell(info: Any = None) -> None:
+    """``pre_run_cell`` hook — remember the cell that is about to execute."""
+    global _cell_source
+    # Older IPython called this with no argument; tolerate both.
+    _cell_source = getattr(info, "raw_cell", None)
+
+
+def _install_cell_hook() -> bool:
+    """Register the cell hook when running under IPython/Jupyter.
+
+    A plain interpreter has no cells, so this is a no-op there and
+    ``_take_cell_source`` simply keeps returning None — demo.py behaves exactly
+    as it did before.
+    """
+    try:
+        from IPython import get_ipython
+    except ImportError:
+        return False
+    ip = get_ipython()
+    if ip is None:  # imported inside IPython's own process but not a shell
+        return False
+    ip.events.register("pre_run_cell", _capture_cell)
+    return True
+
+
+_cell_hook_installed = _install_cell_hook()
+
+
+def _take_cell_source() -> Optional[str]:
+    """The current cell's code, trimmed for transport, or None outside a notebook.
+
+    Sent on every run rather than once per cell: v1 runs are independent siblings
+    under the tunnel run, so each one should be able to explain itself.
+    """
+    if not log_cell_source or not _cell_source:
+        return None
+    text = _cell_source.strip()
+    if len(text) > _MAX_CELL_CHARS:
+        text = f"{text[:_MAX_CELL_CHARS]}\n... [truncated, {len(text)} chars]"
+    return text or None
+
+
 def _render_figures(figures: Any) -> list[dict[str, Any]]:
     """Render matplotlib figures to SVG and base64-encode them for transport.
 
@@ -254,7 +307,13 @@ def _render_figures(figures: Any) -> list[dict[str, Any]]:
         fig.savefig(buf, format="svg", bbox_inches="tight")
         label = getattr(fig, "label", "") or f"figure_{index}"
         payload.append({
-            "id": getattr(fig, "number", index),
+            # No figure_id. Since Runner 1.35.1 it is a *replace* key: a second
+            # store under the same id overwrites the first and the batch is
+            # rejected outright if two items share one. Every new_flow_run(figures=)
+            # call here creates a fresh run, so there is nothing to redraw over,
+            # and manufacturing ids from fig.number would collide the moment a
+            # bare Figure() (no .number) sat next to a pyplot figure numbered the
+            # same as its list position. Omitting it stores each plot on its own.
             "filename": f"{label}.svg",
             "svg_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
         })
@@ -282,15 +341,18 @@ def new_flow_run(
     ``status`` must be ``"FINISHED"`` or ``"FAILED"``. ``devices`` are sent as IDs
     and re-resolved server-side.
 
-    Two server-side paths, because plots constrain how the run must be made. With
-    no figures this is one ``blt.new_flow_run`` call, which writes a completed
-    history entry. With figures, the tunnel must *enter* the new run's context
-    before storing them (visualizations attach to whichever run is current), so it
-    uses ``enter_new_flow_run``. Same visible result; different call underneath.
+    Two server-side paths, because plots and logs constrain how the run must be
+    made. A bare run is one ``blt.new_flow_run`` call, which writes a completed
+    history entry. But a history entry has no log stream and is not current, so
+    anything that must be *written into* the run — visualizations, or the cell
+    source when running under Jupyter — forces the tunnel to actually enter the
+    new run's context via ``enter_new_flow_run``. Same visible result; different
+    call underneath.
     """
     device_ids = [d.id for d in devices] if devices else None
+    cell_source = _take_cell_source()
 
-    if figures is None:
+    if figures is None and cell_source is None:
         return _call(
             "new_flow_run",
             name=name,
@@ -306,13 +368,15 @@ def new_flow_run(
     result = _call(
         "create_flow_run",
         name=name,
+        script_name=script_name,
         flow_id=flow_id,
         device_ids=device_ids,
         output=output,
         parameters=parameters,
         error_message=error_message,
         status=status,
-        visualizations=_render_figures(figures),
+        visualizations=_render_figures(figures) if figures is not None else None,
+        cell_source=cell_source,
     )
     # The run is created either way; surface partial failures rather than letting
     # a plot or output silently go missing.

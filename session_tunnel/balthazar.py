@@ -49,7 +49,8 @@ __all__ = [
     "output",
     "parent",
     "parents",
-    "context",
+    "log_cell_source",
+    "tunnel_state",
     "reset_contexts",
     "info",
     "warn",
@@ -206,6 +207,14 @@ def __getattr__(name: str) -> Any:
         raise NotImplementedError(
             "blt.secrets is deliberately not tunnelled: it would make any process "
             "that can reach the port able to read your credentials."
+        )
+    if name == "context":
+        raise NotImplementedError(
+            "blt.context (the Runner's FlowRunContext for the current run, added in "
+            "1.35.1) is not emulated. Use the module-level names — blt.output, "
+            "blt.devices, blt.params — which this shim already rebinds to the "
+            "innermost open context, or blt.tunnel_state() for the server's own view "
+            "of the context stack."
         )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -407,6 +416,70 @@ search_objects = search_devices
 
 
 # ----------------------------------------------------------------------------
+# Notebook cell capture
+# ----------------------------------------------------------------------------
+
+log_cell_source = True
+"""Send the notebook cell that opened a run into that run's Balthazar logs.
+
+Set ``blt.log_cell_source = False`` to stop shipping your source to the server.
+"""
+
+_MAX_CELL_CHARS = 8000
+_cell_source: Optional[str] = None
+
+
+def _capture_cell(info: Any = None) -> None:
+    """``pre_run_cell`` hook — remember the cell that is about to execute."""
+    global _cell_source
+    # Older IPython called this with no argument; tolerate both.
+    _cell_source = getattr(info, "raw_cell", None)
+
+
+def _install_cell_hook() -> bool:
+    """Register the cell hook when running under IPython/Jupyter.
+
+    A plain interpreter has no cells, so this is a no-op there and
+    ``_take_cell_source`` keeps returning None — demo_sessions.py is unaffected.
+    """
+    try:
+        from IPython import get_ipython
+    except ImportError:
+        return False
+    ip = get_ipython()
+    if ip is None:  # imported inside IPython's process but not from a shell
+        return False
+    ip.events.register("pre_run_cell", _capture_cell)
+    return True
+
+
+_cell_hook_installed = _install_cell_hook()
+
+
+def _take_cell_source() -> Optional[str]:
+    """The current cell's code, trimmed for transport, or None outside a notebook.
+
+    Sent on *every* context the cell opens, not just the first. The innermost run
+    is the one that carries the plots, output and device writes, so that is the
+    run you open when something looks wrong — it has to be able to show the code
+    that produced it.
+
+    The cost is that the Runner propagates a child's log up into every ancestor,
+    so an outer run in a nested cell lists the same block once per context below
+    it. Redundant, but the alternative loses the code exactly where it is most
+    wanted.
+    """
+    if not log_cell_source or not _cell_source:
+        return None
+    text = _cell_source.strip()
+    if not text:
+        return None
+    if len(text) > _MAX_CELL_CHARS:
+        text = f"{text[:_MAX_CELL_CHARS]}\n... [truncated, {len(text)} chars]"
+    return text
+
+
+# ----------------------------------------------------------------------------
 # plt.show() capture
 # ----------------------------------------------------------------------------
 
@@ -424,6 +497,11 @@ def _render_open_figures() -> list[dict[str, Any]]:
         data = buf.getvalue()
         label = getattr(fig, "label", "") or f"figure_{index}"
         payload.append({
+            # The matplotlib figure number becomes the server-side figure_id, which
+            # since Runner 1.35.1 is a *replace* key. That is what we want in a
+            # session: redrawing figure 1 across several plt.show() calls leaves the
+            # run holding the latest frame instead of a pile of intermediate ones.
+            # Open figure numbers are unique, so a batch never self-collides.
             "id": num,
             "filename": f"{label}.svg",
             "svg_base64": base64.b64encode(data).decode("ascii"),
@@ -592,6 +670,7 @@ def enter_new_flow_run(
         flow_id=flow_id,
         device_ids=[d.id for d in devices] if devices else None,
         parameters=parameters or {},
+        cell_source=_take_cell_source(),
     )
     frame = _Frame(payload["flow_run_id"], name, parameters, devices)
     _frames.append(frame)
@@ -631,8 +710,16 @@ def parent() -> Optional[dict[str, Any]]:
     return items[-1] if items else None
 
 
-def context() -> dict[str, Any]:
-    """Ask the server what it thinks the context stack is (a consistency check)."""
+def tunnel_state() -> dict[str, Any]:
+    """Ask the server what it thinks the context stack is (a consistency check).
+
+    Named ``tunnel_state`` rather than ``context`` because Runner 1.35.1 added a
+    real ``balthazar.context`` — the `FlowRunContext` bound to the current run,
+    an object rather than a callable. Keeping this helper under that name would
+    make shim-tested code fail on a real Runner with ``'FlowRunContext' object is
+    not callable``, which is exactly the class of surprise the shim exists to
+    prevent. This is tunnel bookkeeping, not part of the emulated API.
+    """
     return _call("ping")
 
 

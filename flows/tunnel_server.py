@@ -26,12 +26,17 @@ also protects the module-level context globals (``blt.params``, ``blt.output``,
 ``blt.devices``), which a concurrent child-run context would corrupt.
 
 HOW PLOTS REACH A NEW FLOW RUN.
-``blt.api.store_visualizations([(id, filename, svg_bytes)])`` — the same call the
+``blt.store_visualizations([VisualizationBuilder(...)])`` — the same call the
 Runner's own matplotlib backend makes on ``plt.show()`` — attaches to whatever
-flow run is current, and returns nothing. So a plot can only land on a new run
-while that run is current, which means entering its context. The client renders
-figures to SVG locally and ships the bytes; this flow stores them inside an
-``enter_new_flow_run`` block.
+flow run is current and returns the stored ``VisualizationMeta`` list. So a plot
+can only land on a new run while that run is current, which means entering its
+context. The client renders figures to SVG locally and ships the bytes; this flow
+stores them inside an ``enter_new_flow_run`` block.
+
+Module-level names are bound methods of ``blt.context``, which the Runner rewrites
+in place when a run is entered, so ``blt.store_visualizations`` inside the block
+still targets the child run. Before Runner 1.35.1 this call lived on ``blt.api``,
+which no longer exists.
 
 SECURITY. The tunnel grants full read access to the space's devices and can
 create flow runs, so it binds 127.0.0.1 only, requires a per-session bearer
@@ -133,12 +138,19 @@ def _resolve_devices(device_ids):
 
 
 def _decode_visualizations(visualizations):
-    """Turn the client's payload into (figure_number, filename, bytes) tuples.
+    """Turn the client's payload into ``blt.VisualizationBuilder`` objects.
 
-    Matches the shape ``blt.api.store_visualizations`` expects, which is what the
-    Runner's own matplotlib backend passes it.
+    Since Runner 1.35.1 ``blt.store_visualizations`` takes builders, not the
+    ``(figure_id, filename, bytes)`` tuples the removed ``blt.api`` accepted.
+
+    The client's ``id`` is its local matplotlib figure number, which maps onto
+    ``figure_id``: storing again under the same id *replaces* the previous
+    visualization, so a redrawn figure leaves no intermediate frames behind. That
+    is what we want, but it also means the batch is rejected if two items share an
+    id — checked here, where the offending file can still be named.
     """
     decoded = []
+    seen = set()
     for index, item in enumerate(visualizations or [], start=1):
         filename = item.get("filename") or f"figure_{index}.svg"
         if not filename.endswith(".svg"):
@@ -147,8 +159,45 @@ def _decode_visualizations(visualizations):
             data = base64.b64decode(item["svg_base64"], validate=True)
         except (KeyError, ValueError) as exc:
             raise ValueError(f"Bad visualization payload for {filename!r}: {exc}") from exc
-        decoded.append((int(item.get("id", index)), filename, data))
+
+        figure_id = item.get("figure_id", item.get("id"))
+        if figure_id is not None:
+            figure_id = int(figure_id)
+            if figure_id in seen:
+                raise ValueError(
+                    f"Duplicate figure_id {figure_id} for {filename!r}; the store is "
+                    f"transactional and rejects a batch whose items replace each other."
+                )
+            seen.add(figure_id)
+
+        decoded.append(
+            blt.VisualizationBuilder(
+                filename,
+                data,
+                type=blt.VisualizationDataType.SVG,
+                figure_id=figure_id,
+            )
+        )
     return decoded
+
+
+_MAX_CELL_CHARS = 8000
+
+
+def _log_cell_source(source):
+    """Log the notebook cell that produced this run, into that run's own logs.
+
+    Only meaningful inside an entered context — a history entry made by
+    ``blt.new_flow_run`` has no log stream, which is why the client routes runs
+    that carry a cell source through ``create_flow_run`` instead.
+
+    Truncated server-side as well as client-side: the body limit is 32 MB and an
+    arbitrary client could otherwise bury a run's log under one paste.
+    """
+    text = str(source).strip()
+    if len(text) > _MAX_CELL_CHARS:
+        text = f"{text[:_MAX_CELL_CHARS]}\n... [truncated, {len(text)} chars]"
+    blt.info(f"[tunnel] cell source:\n{text}")
 
 
 # ----------------------------------------------------------------------------
@@ -223,6 +272,7 @@ def _op_create_flow_run(kwargs):
     for FAILED.
     """
     visualizations = _decode_visualizations(kwargs.get("visualizations"))
+    cell_source = kwargs.get("cell_source")
     output = kwargs.get("output") or {}
     parameters = kwargs.get("parameters") or {}
     want_failed = (kwargs.get("status") or "FINISHED").upper() == "FAILED"
@@ -230,6 +280,7 @@ def _op_create_flow_run(kwargs):
 
     child_id = None
     stored = 0
+    stored_ids = []
     problems = []
 
     def _guarded(label, fn):
@@ -246,16 +297,24 @@ def _op_create_flow_run(kwargs):
     try:
         with blt.enter_new_flow_run(
             name=kwargs.get("name"),
+            script_name=kwargs.get("script_name"),
             flow_id=kwargs.get("flow_id") or blt.flow.id,
             devices=_resolve_devices(kwargs.get("device_ids")),
             parameters=parameters,
         ):
             child_id = blt.flow_run.id
 
-            if visualizations and _guarded(
-                "store_visualizations", lambda: blt.api.store_visualizations(visualizations)
-            ):
-                stored = len(visualizations)
+            # First, so the run reads top-down: the code, then what it produced.
+            if cell_source:
+                _guarded("log_cell_source", lambda: _log_cell_source(cell_source))
+
+            def _store():
+                # store_visualizations returns the stored VisualizationMeta list,
+                # so the client gets real IDs back instead of just a count.
+                stored_ids.extend(v.id for v in blt.store_visualizations(visualizations))
+
+            if visualizations and _guarded("store_visualizations", _store):
+                stored = len(stored_ids)
 
             if output:
                 _guarded("output.update", lambda: blt.output.update(output))
@@ -270,6 +329,7 @@ def _op_create_flow_run(kwargs):
     return {
         "flow_run_id": child_id,
         "visualizations_stored": stored,
+        "visualization_ids": stored_ids,
         "status": "FAILED" if want_failed else "FINISHED",
         "problems": problems,
     }

@@ -180,5 +180,5 @@ print(f"   run {run.flow_run_id} closed as FAILED")
 # --- 6. Back at the top level ---------------------------------------------------
 print("\n6. wrap up")
 print(f"   open contexts: {len(blt.parents())} (expect 0)")
-print(f"   server agrees: depth {blt.context()['depth']}")
+print(f"   server agrees: depth {blt.tunnel_state()['depth']}")
 blt.info("session-tunnel demo finished from the local debugger")

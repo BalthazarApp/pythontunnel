@@ -139,7 +139,20 @@ def _resolve_devices(device_ids):
 
 
 def _decode_visualizations(items):
+    """Turn the client's payload into ``blt.VisualizationBuilder`` objects.
+
+    Since Runner 1.35.1 ``blt.store_visualizations`` takes builders, not the
+    ``(figure_id, filename, bytes)`` tuples the removed ``blt.api`` accepted.
+
+    The client's ``id`` is its local matplotlib figure number, which maps onto
+    ``figure_id``: storing again under the same id *replaces* the previous
+    visualization. That matters most here — a session client redraws the same
+    figure across many requests, and replace-semantics keep the run holding the
+    latest frame rather than every intermediate one. The batch is rejected if two
+    items share an id, so check it here where the offending file can be named.
+    """
     decoded = []
+    seen = set()
     for index, item in enumerate(items or [], start=1):
         filename = item.get("filename") or f"figure_{index}.svg"
         if not filename.endswith(".svg"):
@@ -148,8 +161,45 @@ def _decode_visualizations(items):
             data = base64.b64decode(item["svg_base64"], validate=True)
         except (KeyError, ValueError) as exc:
             raise ValueError(f"Bad visualization payload for {filename!r}: {exc}") from exc
-        decoded.append((int(item.get("id", index)), filename, data))
+
+        figure_id = item.get("figure_id", item.get("id"))
+        if figure_id is not None:
+            figure_id = int(figure_id)
+            if figure_id in seen:
+                raise ValueError(
+                    f"Duplicate figure_id {figure_id} for {filename!r}; the store is "
+                    f"transactional and rejects a batch whose items replace each other."
+                )
+            seen.add(figure_id)
+
+        decoded.append(
+            blt.VisualizationBuilder(
+                filename,
+                data,
+                type=blt.VisualizationDataType.SVG,
+                figure_id=figure_id,
+            )
+        )
     return decoded
+
+
+_MAX_CELL_CHARS = 8000
+
+
+def _log_cell_source(source):
+    """Log the notebook cell that opened this run, into the run's own logs.
+
+    Called just after entering, so the run reads top-down: the code first, then
+    whatever it produced. The Runner propagates a context log up into every
+    ancestor, so this also surfaces in the tunnel's own run without a second call.
+
+    Truncated server-side as well as client-side: the body limit is 64 MB and an
+    arbitrary client could otherwise bury a run's log under one paste.
+    """
+    text = str(source).strip()
+    if len(text) > _MAX_CELL_CHARS:
+        text = f"{text[:_MAX_CELL_CHARS]}\n... [truncated, {len(text)} chars]"
+    blt.info(f"[tunnel] cell source:\n{text}")
 
 
 # ----------------------------------------------------------------------------
@@ -272,6 +322,16 @@ def _op_enter_flow_run(kwargs):
     })
     _stats["flow_runs_entered"] += 1
     blt.info(f"[tunnel] entered run {blt.flow_run.id} (depth {len(_stack)})")
+
+    # Guarded: a malformed cell payload must not redden a run that opened fine,
+    # and the client is mid-`with` here so it cannot handle the failure anyway.
+    cell_source = kwargs.get("cell_source")
+    if cell_source:
+        try:
+            _log_cell_source(cell_source)
+        except Exception as exc:  # noqa: BLE001 - logging is never worth the run
+            blt.warn(f"[tunnel] could not log cell source: {type(exc).__name__}: {exc}")
+
     return _context_snapshot()
 
 
@@ -300,9 +360,15 @@ def _op_store_visualizations(kwargs):
             "enter a run first (or use the v1 tunnel's figures= argument)."
         )
     visualizations = _decode_visualizations(kwargs.get("visualizations"))
-    blt.api.store_visualizations(visualizations)
-    _stats["visualizations_stored"] += len(visualizations)
-    return {"stored": len(visualizations), "flow_run_id": blt.flow_run.id}
+    # Module-level names are bound methods of blt.context, which the Runner
+    # rewrites in place on enter, so this targets the innermost open run.
+    metas = blt.store_visualizations(visualizations)
+    _stats["visualizations_stored"] += len(metas)
+    return {
+        "stored": len(metas),
+        "visualization_ids": [m.id for m in metas],
+        "flow_run_id": blt.flow_run.id,
+    }
 
 
 def _op_set_output(kwargs):
