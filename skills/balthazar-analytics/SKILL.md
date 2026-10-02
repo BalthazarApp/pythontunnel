@@ -17,7 +17,7 @@ clear division of labour:
 - **`blt_analytics`** (Python) fetches the *actual values* through the tunnel into
   your process and gives you pandas frames. What you do with that data is your business.
 
-The tunnel must be up — the **v3 reflection bridge**, over the Balthazar app tunnel: start
+The tunnel must be up — the **reflection bridge**, over the Balthazar app tunnel: start
 `flows/tunnel_bridge.py`, click "Open app" in Balthazar, copy the snippet/URL, and
 `blt-tunnel connect "<app url>"` (or `balthazar_remote.connect(...)` directly in Python).
 If anything fails to connect, run `blt-tunnel doctor` (it reports the bridge and runs the
@@ -130,10 +130,9 @@ device cache** (SPEC §6), which `devices_df` uses automatically — no API chan
   `index=`/`value=` path `refresh=True` re-fetches only the **already-known** device ids
   for that value (it will not surface brand-new devices). The **first** cache load can take
   minutes; a call that triggers it blocks. To pick up newly-added devices, ask the tunnel
-  to reload, then call `devices_df` again — on **v3** that is
-  `import balthazar as blt; blt.tunnel.refresh_device_cache()`, on the legacy **v2** shim
-  `blt.refresh_device_cache()`. See the **balthazar-tunnel** skill for cache configuration
-  and status.
+  to reload, then call `devices_df` again —
+  `import balthazar as blt; blt.tunnel.refresh_device_cache()`. See the **balthazar-tunnel**
+  skill for cache configuration and status.
 
 ## Presenting results
 

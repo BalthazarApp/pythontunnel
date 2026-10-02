@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "blt_analytics"
 version = "0.1.0"
-description = "Schema-only analytics tools over the Balthazar v3 reflection bridge."
+description = "Schema-only analytics tools over the Balthazar reflection bridge."
 readme = "README.md"
 requires-python = ">=3.10"
 # The core package is deliberately dependency-free: digest.py and _blt.py are

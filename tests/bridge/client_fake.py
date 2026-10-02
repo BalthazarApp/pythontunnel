@@ -1,15 +1,13 @@
-"""In-process fakes for the v3 client tests.
+"""In-process fakes for the client tests.
 
 Two things live here, both owned by the client test suite:
 
-* :class:`FakeBridge` — a tiny protocol-3 bridge server (the remoteblt4 parts
-  protocol, pending/poll, release, heartbeat and the ``tunnel`` namespace) backed by
-  a reflective :class:`Backend`. It exists so the client tests do not depend on
-  ``flows/tunnel_bridge.py`` (owned by another agent) and can inject faults the real
-  server would not.
+* :class:`FakeBridge` — a tiny protocol-3 bridge server (the parts protocol,
+  pending/poll, release, heartbeat and the ``tunnel`` namespace) backed by a
+  reflective :class:`Backend`. It exists so the client tests do not depend on
+  ``flows/tunnel_bridge.py`` and can inject faults the real server would not.
 * loaders — import the client ``balthazar_remote`` and the ``bridge/balthazar.py``
-  drop-in by path, and stand up the **unmodified** ``remoteblt4/app/bridge.py``
-  handler with a backend injected as ``balthazar`` (for the compatibility test).
+  drop-in by path.
 
 This is test code, not part of the shipped client.
 """
@@ -46,7 +44,7 @@ BRIDGE_VERSION = "3.0.0"
 # ---------------------------------------------------------------------------
 def load_balthazar_remote():
     path = os.path.join(REPO, "bridge", "balthazar_remote.py")
-    spec = importlib.util.spec_from_file_location("v3_balthazar_remote", path)
+    spec = importlib.util.spec_from_file_location("bridge_balthazar_remote", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -54,26 +52,9 @@ def load_balthazar_remote():
 
 def load_dropin():
     path = os.path.join(REPO, "bridge", "balthazar.py")
-    spec = importlib.util.spec_from_file_location("v3_balthazar_dropin", path)
+    spec = importlib.util.spec_from_file_location("bridge_balthazar_dropin", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module
-
-
-def load_remoteblt4_bridge(backend):
-    """Inject ``backend`` as ``balthazar`` and load the unmodified remoteblt4 handler."""
-    path = os.path.join(REPO, "remoteblt4", "app", "bridge.py")
-    saved = sys.modules.get("balthazar")
-    sys.modules["balthazar"] = backend
-    try:
-        spec = importlib.util.spec_from_file_location("v3_remoteblt4_bridge", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    finally:
-        if saved is not None:
-            sys.modules["balthazar"] = saved
-        else:
-            sys.modules.pop("balthazar", None)
     return module
 
 

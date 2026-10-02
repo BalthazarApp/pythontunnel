@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 
-from v3._helpers import OWNER
+from bridge._helpers import OWNER
 
 INDEXES = json.dumps({"by_wafer": {"path": "hierarchy.wafer", "device_type": "Chip"}})
 

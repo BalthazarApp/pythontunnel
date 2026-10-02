@@ -1,7 +1,7 @@
 """Transport-agnostic ``blt-tunnel`` / ``mcp_server`` guard tests.
 
-The v3 connect / disconnect / doctor and the v3-specific MCP guard behaviour live in
-``tests/test_analytics_v3.py``. What remains here is independent of the transport: the
+The connect / disconnect / doctor and the bridge-specific MCP guard behaviour live in
+``tests/test_analytics_bridge.py``. What remains here is independent of the transport: the
 parser never accepts a password on the command line, and ``_guard`` converts a raised
 error into a JSON error dict.
 """

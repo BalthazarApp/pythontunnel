@@ -1,30 +1,28 @@
-# v3 bridge: interface spec
+# Bridge: interface spec
 
-v3 replaces the v2 session tunnel's transport with a **generic reflection bridge**, based on
-the `remoteblt3/` prototype (untracked, gitignored; credit it in module docstrings). The bridge
+The transport is a **generic reflection bridge** over the Balthazar app tunnel. The bridge
 uses `new_flow_run_context` (Runner >= 1.35.1). It has no main-thread job queue, no
-single-owner lock, and one transport, the Balthazar app tunnel. v1 and v2 stay in the repo
-untouched as legacy. Work happens on branch `feature/v3-bridge`. No agent commits.
+single-owner lock, and one transport, the Balthazar app tunnel.
 
 ## Layout
 
 ```
-flows/tunnel_bridge.py         the v3 server flow: one file, stdlib-only; imports blt_analytics.digest
+flows/tunnel_bridge.py         the server flow: one file, stdlib-only; imports blt_analytics.digest
                                only for space_schema
-bridge/balthazar_remote.py     the v3 client: remoteblt3's client, extended; one file, stdlib-only
+bridge/balthazar_remote.py     the client (Remote): one file, stdlib-only
 bridge/balthazar.py            drop-in module: `import balthazar as blt` connects from the profile
                                and delegates to the Remote
-blt_analytics/…                gets the blt module from the v3 bridge first, using the tunnel namespace
-tests/v3/…                     v3 tests (fakes: reuse tests/fakes/fake_blt.py, extended)
+blt_analytics/…                gets the blt module from the bridge first, using the tunnel namespace
+tests/bridge/…                 bridge tests (fakes: reuse tests/fakes/fake_blt.py, extended)
 ```
 
 ## Protocol (POST `/call`, JSON; GET `/` serves the snippet page)
 
-This is the prototype's protocol (`describe`, `call`, `get`, `set`, `getitem`, `contains`,
-`setitem`, `delitem`, `enter`, `exit`, the value tags `$obj` / `$ref` / `$attr` / `$new` /
-…), with these changes. **Server agent and client agent must both follow them exactly.**
+The protocol has these ops: `describe`, `call`, `get`, `set`, `getitem`, `contains`,
+`setitem`, `delitem`, `enter`, `exit`, plus the value tags `$obj` / `$ref` / `$attr` / `$new` /
+… . The details below are the contract the server and client both follow exactly.
 
-1. **`describe`** additionally returns:
+1. **`describe`** returns:
    - `protocol: 3`
    - `bridge_version: "3.0.0"`
    - `user`: the caller id
@@ -35,7 +33,7 @@ This is the prototype's protocol (`describe`, `call`, `get`, `set`, `getitem`, `
    - `idle_timeout_s`, `call_timeout_s`
 
    The client refuses to connect if `protocol != 3`, with a one-sentence error naming both
-   versions.
+   protocol numbers.
 2. **Long calls.** The server runs every non-`describe` request in a worker thread and waits
    up to `call_timeout_s` (default 45). If the request isn't done by then, it replies
    `{"ok": true, "pending": "<job id>"}`. The client then sends `{"op": "poll", "job": id}`
@@ -66,8 +64,8 @@ This is the prototype's protocol (`describe`, `call`, `get`, `set`, `getitem`, `
    - The audit log uses a reference to `blt.info` captured at import, so it can't be patched.
    - Error replies carry `traceback` only for the owner. Other callers in shared mode get
      type and message only.
-8. **Snapshots** work as in the prototype, including `"self"` re-encoding after
-   ref-targeted ops (keep that; optimizing it is out of scope).
+8. **Snapshots** re-encode `"self"` after ref-targeted ops (keep that; optimizing it is out
+   of scope).
 
 ## Flow parameters (`blt.params`, all optional)
 
@@ -83,18 +81,17 @@ This is the prototype's protocol (`describe`, `call`, `get`, `set`, `getitem`, `
 | `warm_device_cache` | `true` if indexes are configured | start loading the cache at start |
 | `device_cache_dir` | `~/.balthazar_tunnel_cache` | on the Runner; files 0600, dir 0700 |
 
-Auth works as in the prototype:
+Auth:
 - `X-BLT-User-Id` is required;
 - the owner is `blt.user` (case-insensitive);
 - browser POSTs (`Origin` or `Sec-Fetch-Site` present) are rejected;
 - `GET /` is visible to allowed users.
 
-In shared mode, an audit line is written per call, as in the prototype.
+In shared mode, an audit line is written per call.
 
 ## Tunnel functions (server side, in `flows/tunnel_bridge.py`)
 
-Port the logic from v2 `flows/tunnel_session_server.py` §6 (it's tested). Without the
-main-thread queue, it gets simpler: everything just calls `blt.*` from threads.
+Without a main-thread queue everything just calls `blt.*` from threads.
 
 | name | signature | returns |
 |---|---|---|
@@ -111,8 +108,8 @@ main-thread queue, it gets simpler: everything just calls `blt.*` from threads.
 
 ## Client (`bridge/balthazar_remote.py`)
 
-Start from `remoteblt3/balthazar_remote.py`, which has the working `_find_site`. Keep its
-login code and public API (`connect(app_url, site=None, login="device", …)`). Add:
+The client exposes `connect(app_url, site=None, login="device", …)` with `_find_site` and the
+OAuth login code, plus:
 
 1. **`interactive=True` parameter.** When `False`, a missing or invalid token raises
    `LoginRequired(BridgeError)` ("run `blt-tunnel connect` in a terminal") instead of
@@ -152,7 +149,7 @@ login code and public API (`connect(app_url, site=None, login="device", …)`). 
    8000 chars); `enter_new_flow_run` logs it via the context's `info` right after entering.
    It can be switched off with `remote.log_cell_source = False`.
 9. **`blt.output` primitives check:**
-   - assigning a dict, date or DataFrame to output raises `TypeError` client-side, as in v2;
+   - assigning a dict, date or DataFrame to output raises `TypeError` client-side;
    - flat lists of primitives are allowed.
 10. **`isinstance` support.** Class symbols (`blt.Device`, `blt.Flow`, …) are real Python
     classes, made with a metaclass whose `__instancecheck__` matches the
@@ -170,34 +167,30 @@ login code and public API (`connect(app_url, site=None, login="device", …)`). 
       in `describe`.
     - Long tunnel calls (`state` loading or building) are polled every 2 s until ready, with
       a notice.
-12. Remote exceptions keep the prototype's mapping (`RemoteError` + builtin subclass +
-    `remote_traceback`).
+12. Remote exceptions use the mapping `RemoteError` + builtin subclass + `remote_traceback`.
 
 ## `bridge/balthazar.py` (drop-in)
 
 This is a module whose `__getattr__` (PEP 562) lazily calls `connect_from_profile()` once
 and delegates every attribute to that Remote. It exposes `__balthazar_tunnel__ = 3` as a
 marker. Running from `bridge/`, or with `bridge/` on `sys.path`, gives
-`import balthazar as blt` with the real module's names. On a Runner the builtin wins, as
-before.
+`import balthazar as blt` with the real module's names. On a Runner the builtin wins.
 
 ## blt_analytics integration
 
-- **`_blt.get_blt()` order:** the real Runner module; else the v3 drop-in when
+- **`_blt.get_blt()` order:** the real Runner module; else the bridge drop-in when
   `~/.balthazar_bridge.json` or `BALTHAZAR_BRIDGE_URL` exists, loaded by path from
-  `<repo>/bridge/balthazar.py` or `$BLT_BRIDGE_DIR`; else the v2 shim (legacy). Add
-  `bridge_version()`, which returns 3, 2 or None.
-- **frames:** on v3, the server-cache fast path uses `blt.tunnel.cached_devices_query` and
-  `blt.tunnel.cached_devices`. The v2 shim-only `keys=` projection on `search_devices` isn't
-  available on v3; fall back to plain paging.
-- **schema:** `get_digest()` on v3 calls `blt.tunnel.space_schema()` and polls until
-  `ready`.
+  `<repo>/bridge/balthazar.py` or `$BLT_BRIDGE_DIR`. `is_tunnel()` reports whether the located
+  module is the bridge.
+- **frames:** the server-cache fast path uses `blt.tunnel.cached_devices_query` and
+  `blt.tunnel.cached_devices`. There is no `search_devices` projection pushdown; `search_devices`
+  pages plainly.
+- **schema:** `get_digest()` calls `blt.tunnel.space_schema()` and polls until `ready`.
 - **CLI:**
-  - `blt-tunnel connect APP_URL` writes the v3 profile after a successful `describe` (via
+  - `blt-tunnel connect APP_URL` writes the profile after a successful `describe` (via
     `balthazar_remote.save_profile`) and prints the owner, caller, `shared` and the flow run.
-  - `doctor` reports the v3 bridge.
+  - `doctor` reports the bridge.
   - The MCP server sets `BALTHAZAR_TUNNEL_NONINTERACTIVE=1` before connecting.
-- Skills and README describe v3 as the recommended path and v2 as legacy.
 
 ## Testing
 
@@ -210,12 +203,10 @@ before.
   client gets a test hook that skips login, sends `X-BLT-User-Id` directly, and posts to
   `http://127.0.0.1:port/`.
 
-## Large payloads: remoteblt4's parts protocol (adopted as-is)
+## Large payloads
 
-The base is now **`remoteblt4/`**: `remoteblt3/` was replaced by it. Wherever this spec says
-remoteblt3, read remoteblt4. remoteblt4 already splits and stitches in both directions, and it
-works past the platform's 5 MB app-tunnel cap. **Keep its wire format exactly**, so its client
-and ours stay compatible:
+Large results and uploads are split and stitched in both directions, so transfers work past
+the platform's 5 MB app-tunnel cap. The wire format:
 - `PART_BYTES = 2 MiB`, `PART_TTL = 300` s, `MAX_PARTS = 512`, with zlib compression of the
   whole body. `describe` returns `"parts": PART_BYTES`.
 - **Downloads (runner → client).** When the client sends the `X-Bridge-Parts: 1` header and the
@@ -234,6 +225,6 @@ and ours stay compatible:
   - The reply to each earlier part is `{"ok": true, "result": null}`.
 - This applies to **every** reply, including `poll` and `tunnel` replies. `part` requests
   aren't audited, aren't turned into pending jobs, and aren't split themselves.
-- Transfers are scoped per caller, as in remoteblt4. Our additions on top:
-  - the flow param `part_bytes`, defaulting to remoteblt4's 2 MiB;
+- Transfers are scoped per caller:
+  - the flow param `part_bytes`, defaulting to 2 MiB;
   - transfers are dropped by the watchdog when it reclaims a caller.

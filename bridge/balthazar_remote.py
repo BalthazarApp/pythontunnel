@@ -1,16 +1,14 @@
-"""Balthazar v3 remote bridge — client side.
+"""Balthazar remote bridge — client side.
 
 Call the ``balthazar`` Python API from a script on your own computer, over the
 Balthazar app tunnel, against a flow run that serves ``flows/tunnel_bridge.py``.
 
-This file is a direct descendant of ``remoteblt4/balthazar_remote.py`` (the parts
-protocol, the reflection proxies, ``_find_site`` and the OAuth login code are kept
-verbatim in style and on the wire). On top of it this client speaks **protocol 3**:
-a protocol check, pending/poll for long calls, a heartbeat thread, ref-release
-batching, flow-run-context emulation (``enter_new_flow_run``), ``plt.show`` capture,
-notebook cell-source logging, an output-primitive guard, ``isinstance`` support,
-the ``tunnel`` namespace with ``CachedDevice`` results, and a saved connection
-profile. See ``docs/v3/SPEC.md`` §Client for the itemised contract.
+This client speaks **protocol 3**: a protocol check, pending/poll for long calls,
+a heartbeat thread, ref-release batching, flow-run-context emulation
+(``enter_new_flow_run``), ``plt.show`` capture, notebook cell-source logging, an
+output-primitive guard, ``isinstance`` support, the ``tunnel`` namespace with
+``CachedDevice`` results, and a saved connection profile. See ``docs/SPEC.md``
+§Client for the itemised contract.
 
 Everything here is standard library only (Python 3.8+), so the file can be copied
 next to a script with no install.
@@ -182,7 +180,7 @@ def _resolve_interactive(interactive):
 
 
 # ---------------------------------------------------------------------------
-# Value encoding (client -> server). Unchanged from remoteblt4.
+# Value encoding (client -> server).
 # ---------------------------------------------------------------------------
 def _encode(value):
     if isinstance(value, (RemoteObject, RemoteDict, RemoteList)):
@@ -235,8 +233,8 @@ def _arguments(args, kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Reflection proxies (server -> client). Extended from remoteblt4 only to
-# register a weakref finalizer so the ref can be released server-side.
+# Reflection proxies (server -> client). A weakref finalizer is registered so the
+# ref can be released server-side.
 # ---------------------------------------------------------------------------
 class RemoteObject:
     def __init__(self, session, data):
@@ -1413,7 +1411,7 @@ class Remote:
         return sorted(names)
 
     def __repr__(self):
-        return "<balthazar v3 via %s>" % self._session.location
+        return "<balthazar via %s>" % self._session.location
 
     def close(self):
         """Best-effort teardown: close contexts, restore ``plt.show``, stop threads."""
@@ -1609,7 +1607,7 @@ def _check_protocol(description):
         seen = protocol if protocol is not None else "an older one without a protocol field"
         raise BridgeError(
             "this bridge speaks protocol %s but this client needs protocol 3; "
-            "update the bridge flow to v3 (flows/tunnel_bridge.py) or use a matching client"
+            "update the bridge flow (flows/tunnel_bridge.py) or use a matching client"
             % (seen,)
         )
 
@@ -1632,7 +1630,7 @@ def connect(
     _test_user_id=None,
     _skip_protocol_check=False,
 ):
-    """Connect to a v3 bridge and return a :class:`Remote`.
+    """Connect to a bridge and return a :class:`Remote`.
 
     ``interactive=False`` (or ``$BALTHAZAR_TUNNEL_NONINTERACTIVE=1``) turns a
     missing/invalid token into :class:`LoginRequired` instead of prompting.
@@ -1643,7 +1641,7 @@ def connect(
       POST straight to ``<base>/call`` with ``X-BLT-User-Id: <user>``. ``base`` is
       e.g. ``"http://127.0.0.1:<port>/"``.
     * ``_skip_protocol_check`` — connect even when ``describe`` does not report
-      protocol 3 (used by the compatibility test against the remoteblt4 handler).
+      protocol 3.
     """
     if _test_base_url is not None:
         session = _TestSession(_test_base_url, _test_user_id)
@@ -1663,7 +1661,7 @@ def connect(
 
 
 def save_profile(app_url, login, site=None, ca_file=None):
-    """Write the v3 connection profile to ``~/.balthazar_bridge.json`` (0600).
+    """Write the connection profile to ``~/.balthazar_bridge.json`` (0600).
 
     It never holds a token — those stay in the OAuth token cache
     (``~/.config/balthazar/remote.json``). Returns the profile path.

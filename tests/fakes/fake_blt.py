@@ -274,9 +274,9 @@ _serve_app_calls: list[int] = []
 # space through the server's device cache without perturbing the fixture counts.
 _synthetic_records: list[dict] | None = None
 
-# v3 bridge support: the run-emulation surface. A real Runner exposes
+# Bridge support: the run-emulation surface. A real Runner exposes
 # ``new_flow_run_context`` returning a ``FlowRunContext`` bound to a child run, plus
-# ``VisualizationBuilder`` / ``DeviceBuilder`` / ``new_devices``. The v3 server reflects
+# ``VisualizationBuilder`` / ``DeviceBuilder`` / ``new_devices``. The server reflects
 # these onto the client; the fakes record what crossed so tests can assert attribution
 # and how a context was exited (the watchdog path).
 _flow_run_contexts: list[FlowRunContext] = []
@@ -512,7 +512,7 @@ def fetch_visualizations(visualization_ids: Any) -> dict[str, Visualization]:
 
 
 # ---------------------------------------------------------------------------
-# Run emulation surface (v3 bridge): contexts, builders, new_devices
+# Run emulation surface (bridge): contexts, builders, new_devices
 # ---------------------------------------------------------------------------
 
 

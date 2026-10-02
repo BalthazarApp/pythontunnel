@@ -102,12 +102,12 @@ def test_space_key_scopes_the_directory(fake_blt, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# space_key on the v3 bridge: the describe() memoization (perf fix)
+# space_key on the bridge: the describe() memoization (perf fix)
 # ---------------------------------------------------------------------------
 
 
 def _install_fake_tunnel(monkeypatch, describe):
-    """Point the cache's locator at a fake v3 bridge whose ``describe_info`` is given.
+    """Point the cache's locator at a fake bridge whose ``describe_info`` is given.
 
     ``space_key`` resolves tunnel-ness via ``_blt.is_tunnel()`` and the root id via
     ``_blt.describe_info()`` (both ignore the ``blt`` argument), so all three seams

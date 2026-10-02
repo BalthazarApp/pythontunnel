@@ -1,6 +1,6 @@
 """One shrink-and-retry pager for Balthazar flow-run history (stdlib only).
 
-Three call sites page a flow's run history the same robust way — the v2 tunnel
+Three call sites page a flow's run history the same robust way — the bridge
 server's ``space_schema`` builder, :mod:`blt_analytics.schema`'s local-build
 fallback, and :mod:`blt_analytics.frames`'s ``runs_df`` loader. That logic
 (shrink-and-retry, poison-run skip, abandon-after-N, dedupe by id, offset by raw

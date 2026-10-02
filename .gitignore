@@ -9,3 +9,6 @@ build/
 
 # third-party reference code, not part of this repo
 remoteblt*/
+.claude/settings.local.json
+.ipynb_checkpoints/
+bridge/script.py

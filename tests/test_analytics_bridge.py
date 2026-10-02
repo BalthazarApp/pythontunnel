@@ -1,7 +1,7 @@
-"""v3 reflection-bridge integration for ``blt_analytics`` (SPEC "blt_analytics
+"""Reflection-bridge integration for ``blt_analytics`` (SPEC "blt_analytics
 integration", Client items 5 & 11).
 
-Everything here runs against small in-process stubs — a v3 ``blt`` object exposing a
+Everything here runs against small in-process stubs — a bridge ``blt`` object exposing a
 ``tunnel`` namespace and ``_session.description``, and a stub ``balthazar_remote``
 module — injected by monkeypatching the seams (``_blt.get_blt``,
 ``cli._import_balthazar_remote``). No network, and no dependency on the concurrent
@@ -30,7 +30,7 @@ from fakes import fixture_space
 
 
 # ---------------------------------------------------------------------------
-# v3 stubs
+# bridge stubs
 # ---------------------------------------------------------------------------
 
 
@@ -54,7 +54,7 @@ def _extract(params: dict, dotted: str):
     return cur
 
 
-class _V3Tunnel:
+class _StubTunnel:
     """The ``blt.tunnel`` namespace: tunnel ops that record how they were called."""
 
     def __init__(self, records, *, cache_state="ready", indexes=None, schema_results=None):
@@ -98,8 +98,8 @@ class _V3Tunnel:
         return {"state": "ready", "digest": {"version": 1, "totals": {}}}
 
 
-class _V3Blt:
-    """A stand-in for the v3 drop-in module: the marker, a tunnel namespace, and a
+class _StubBlt:
+    """A stand-in for the bridge drop-in module: the marker, a tunnel namespace, and a
     delegated ``_session.description``."""
 
     def __init__(self, tunnel, description=None):
@@ -112,9 +112,9 @@ def _records():
     return fixture_space.to_records()["devices"]
 
 
-def _use_v3(monkeypatch, blt):
-    """Point the locator at a v3 stub (is_tunnel / bridge_version / tunnel_ns compute
-    naturally from the marker — no need to patch those too)."""
+def _use_bridge(monkeypatch, blt):
+    """Point the locator at a bridge stub (is_tunnel / tunnel_ns compute naturally
+    from the marker — no need to patch those too)."""
     monkeypatch.setattr(blt_locator, "get_blt", lambda: blt)
     return blt
 
@@ -128,21 +128,21 @@ def _cache_and_schema(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# frames: v3 tunnel fast paths
+# frames: tunnel fast paths
 # ---------------------------------------------------------------------------
 
 
-def test_v3_devices_df_uses_tunnel_query(monkeypatch):
-    tunnel = _V3Tunnel(_records())
-    _use_v3(monkeypatch, _V3Blt(tunnel))
+def test_devices_df_uses_tunnel_query(monkeypatch):
+    tunnel = _StubTunnel(_records())
+    _use_bridge(monkeypatch, _StubBlt(tunnel))
     df = frames.devices_df()
     assert len(df) == len(_records())
     assert any(c[0] == "query" for c in tunnel.calls)
 
 
-def test_v3_devices_df_type_and_projection(monkeypatch):
-    tunnel = _V3Tunnel(_records())
-    _use_v3(monkeypatch, _V3Blt(tunnel))
+def test_devices_df_type_and_projection(monkeypatch):
+    tunnel = _StubTunnel(_records())
+    _use_bridge(monkeypatch, _StubBlt(tunnel))
     df = frames.devices_df("Chip", columns=["hierarchy.lot", "resistance.value"])
     assert set(df["type"]) == {"Chip"}
     assert set(df.columns) == {
@@ -153,31 +153,31 @@ def test_v3_devices_df_type_and_projection(monkeypatch):
     assert query[1] == "Chip" and query[2] == ("hierarchy", "resistance")
 
 
-def test_v3_cold_cache_falls_back_to_paging(monkeypatch):
+def test_cold_cache_falls_back_to_paging(monkeypatch):
     # No tunnel.cached_devices_query is used while the cache is cold; devices_df pages
     # search_devices on the module instead. Give the stub a search_devices for that.
-    tunnel = _V3Tunnel(_records(), cache_state="loading")
-    blt = _V3Blt(tunnel)
+    tunnel = _StubTunnel(_records(), cache_state="loading")
+    blt = _StubBlt(tunnel)
     paged = {"called": False}
 
     def search_devices(*, type=None, archived=None, **_ignored):
         paged["called"] = True
-        assert "keys" not in _ignored  # v3 must NOT push the shim-only projection
+        assert "keys" not in _ignored  # the bridge must NOT push a search_devices projection
         recs = _records()
         if type is not None:
             recs = [r for r in recs if r.get("type") == type]
         return [_Dev(r) for r in recs]
 
     blt.search_devices = search_devices
-    _use_v3(monkeypatch, blt)
+    _use_bridge(monkeypatch, blt)
     df = frames.devices_df("Chip", columns=["resistance.value"])
     assert paged["called"] is True
     assert set(df["type"]) == {"Chip"}
 
 
-def test_v3_index_value_uses_tunnel_cached_devices(monkeypatch):
-    tunnel = _V3Tunnel(_records(), indexes={"wafer": "hierarchy.wafer"})
-    _use_v3(monkeypatch, _V3Blt(tunnel))
+def test_index_value_uses_tunnel_cached_devices(monkeypatch):
+    tunnel = _StubTunnel(_records(), indexes={"wafer": "hierarchy.wafer"})
+    _use_bridge(monkeypatch, _StubBlt(tunnel))
     df = frames.devices_df(index="wafer", value="SECRET_wafer_17", refresh=True)
     assert list(df["id"]) == ["dev-chip-1"]
     call = next(c for c in tunnel.calls if c[0] == "cached_devices")
@@ -185,7 +185,7 @@ def test_v3_index_value_uses_tunnel_cached_devices(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# schema: v3 space_schema (polling) + device indexes from describe
+# schema: space_schema (polling) + device indexes from describe
 # ---------------------------------------------------------------------------
 
 
@@ -197,17 +197,17 @@ _DIGEST = {
 }
 
 
-def test_v3_get_digest_via_space_schema(monkeypatch):
-    tunnel = _V3Tunnel([], schema_results=[{"state": "ready", "digest": _DIGEST}])
-    _use_v3(monkeypatch, _V3Blt(tunnel))
+def test_get_digest_via_space_schema(monkeypatch):
+    tunnel = _StubTunnel([], schema_results=[{"state": "ready", "digest": _DIGEST}])
+    _use_bridge(monkeypatch, _StubBlt(tunnel))
     d = schema.get_digest()
     assert d is _DIGEST
     assert ("space_schema", False) in tunnel.calls
 
 
-def test_v3_space_schema_polls_until_ready(monkeypatch):
+def test_space_schema_polls_until_ready(monkeypatch):
     monkeypatch.setattr(schema, "_SCHEMA_POLL_INTERVAL_S", 0)
-    tunnel = _V3Tunnel(
+    tunnel = _StubTunnel(
         [],
         schema_results=[
             {"state": "building", "progress": 0.3},
@@ -215,30 +215,30 @@ def test_v3_space_schema_polls_until_ready(monkeypatch):
             {"state": "ready", "digest": _DIGEST},
         ],
     )
-    _use_v3(monkeypatch, _V3Blt(tunnel))
+    _use_bridge(monkeypatch, _StubBlt(tunnel))
     d = schema.get_digest()
     assert d is _DIGEST
     assert sum(1 for c in tunnel.calls if c[0] == "space_schema") == 3
 
 
-def test_v3_space_schema_error_raises(monkeypatch):
+def test_space_schema_error_raises(monkeypatch):
     monkeypatch.setattr(schema, "_SCHEMA_POLL_INTERVAL_S", 0)
-    tunnel = _V3Tunnel([], schema_results=[{"state": "error", "error": "digest import failed"}])
-    _use_v3(monkeypatch, _V3Blt(tunnel))
+    tunnel = _StubTunnel([], schema_results=[{"state": "error", "error": "digest import failed"}])
+    _use_bridge(monkeypatch, _StubBlt(tunnel))
     with pytest.raises(RuntimeError, match="digest import failed"):
         schema.get_digest()
 
 
-def test_v3_overview_device_indexes_from_describe(monkeypatch):
-    tunnel = _V3Tunnel([], schema_results=[{"state": "ready", "digest": _DIGEST}])
-    blt = _V3Blt(tunnel, description={"device_indexes": {"wafer": "hierarchy.wafer"}})
-    _use_v3(monkeypatch, blt)
+def test_overview_device_indexes_from_describe(monkeypatch):
+    tunnel = _StubTunnel([], schema_results=[{"state": "ready", "digest": _DIGEST}])
+    blt = _StubBlt(tunnel, description={"device_indexes": {"wafer": "hierarchy.wafer"}})
+    _use_bridge(monkeypatch, blt)
     out = schema.overview()
     assert out["device_indexes"] == {"wafer": "hierarchy.wafer"}
 
 
 # ---------------------------------------------------------------------------
-# CLI: connect / disconnect / doctor (v3)
+# CLI: connect / disconnect / doctor
 # ---------------------------------------------------------------------------
 
 
@@ -281,7 +281,7 @@ def _stub_remote_module(*, connect_result=None, connect_error=None):
     return mod
 
 
-def test_v3_connect_saves_profile_and_prints_summary(monkeypatch, capsys):
+def test_connect_saves_profile_and_prints_summary(monkeypatch, capsys):
     remote = _FakeRemote(
         {"user": "caller-7", "owner": "owner-1", "shared": False, "flow_run_id": "run-42"}
     )
@@ -300,7 +300,7 @@ def test_v3_connect_saves_profile_and_prints_summary(monkeypatch, capsys):
     assert mod.calls["connect"][0]["interactive"] is True
 
 
-def test_v3_connect_shared_mode_and_params(monkeypatch, capsys):
+def test_connect_shared_mode_and_params(monkeypatch, capsys):
     remote = _FakeRemote({"user": "u", "owner": "o", "shared": True, "flow_run": "r"})
     mod = _stub_remote_module(connect_result=remote)
     monkeypatch.setattr(cli, "_import_balthazar_remote", lambda: mod)
@@ -317,7 +317,7 @@ def test_v3_connect_shared_mode_and_params(monkeypatch, capsys):
     assert call["ca_file"] == "/tmp/ca.pem"
 
 
-def test_v3_connect_login_required_is_clean_failure(monkeypatch, capsys):
+def test_connect_login_required_is_clean_failure(monkeypatch, capsys):
     mod = _stub_remote_module()
     mod.connect = lambda *a, **k: (_ for _ in ()).throw(
         mod.LoginRequired("run blt-tunnel connect in a terminal")
@@ -328,18 +328,18 @@ def test_v3_connect_login_required_is_clean_failure(monkeypatch, capsys):
     assert rc == 1 and "could not connect" in err
 
 
-def test_v3_disconnect_removes_profile(tmp_path, capsys):
+def test_disconnect_removes_profile(tmp_path, capsys):
     home = tmp_path / "home"
     home.mkdir()
     profile = home / ".balthazar_bridge.json"
     profile.write_text(json.dumps({"app_url": "https://x", "login": "device"}))
     rc = cli.run_disconnect(home=str(home))
     out = capsys.readouterr().out
-    assert rc == 0 and "disconnected the v3 bridge" in out
+    assert rc == 0 and "disconnected the bridge" in out
     assert not profile.exists()
 
 
-def test_v3_disconnect_forget_removes_token(tmp_path, capsys):
+def test_disconnect_forget_removes_token(tmp_path, capsys):
     home = tmp_path / "home"
     home.mkdir()
     (home / ".balthazar_bridge.json").write_text("{}")
@@ -352,7 +352,7 @@ def test_v3_disconnect_forget_removes_token(tmp_path, capsys):
     assert not token.exists()
 
 
-def test_v3_doctor_reports_bridge(monkeypatch, tmp_path, capsys):
+def test_doctor_reports_bridge(monkeypatch, tmp_path, capsys):
     home = tmp_path / "home"
     home.mkdir()
     (home / ".balthazar_bridge.json").write_text("{}")
@@ -360,27 +360,27 @@ def test_v3_doctor_reports_bridge(monkeypatch, tmp_path, capsys):
     token.parent.mkdir(parents=True)
     token.write_text(json.dumps({"a": "t"}))
 
-    tunnel = _V3Tunnel([], schema_results=[{"state": "ready", "digest": _DIGEST}])
-    blt = _V3Blt(tunnel, description={"user": "caller-7", "owner": "owner-1", "shared": False})
+    tunnel = _StubTunnel([], schema_results=[{"state": "ready", "digest": _DIGEST}])
+    blt = _StubBlt(tunnel, description={"user": "caller-7", "owner": "owner-1", "shared": False})
     monkeypatch.setattr(blt_locator, "get_blt", lambda: blt)
 
     project = tmp_path / "proj"
     project.mkdir()
     rc = cli.run_doctor(project=str(project), home=str(home))
     out = capsys.readouterr().out
-    assert "[PASS] bridge: v3 reflection bridge" in out
+    assert "[PASS] bridge: reflection bridge" in out
     assert "[PASS] connection:" in out and "cached login token found" in out
     assert "[PASS] describe:" in out and "caller-7" in out and "owner-1" in out
     assert "[PASS] space_schema:" in out
 
 
-def test_v3_doctor_without_token_skips_describe(monkeypatch, tmp_path, capsys):
+def test_doctor_without_token_skips_describe(monkeypatch, tmp_path, capsys):
     home = tmp_path / "home"
     home.mkdir()
     (home / ".balthazar_bridge.json").write_text("{}")  # profile but no token cache
 
-    tunnel = _V3Tunnel([])
-    blt = _V3Blt(tunnel)
+    tunnel = _StubTunnel([])
+    blt = _StubBlt(tunnel)
     monkeypatch.setattr(blt_locator, "get_blt", lambda: blt)
 
     project = tmp_path / "proj"
@@ -393,7 +393,7 @@ def test_v3_doctor_without_token_skips_describe(monkeypatch, tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# MCP: non-interactive, clear LoginRequired errors (v3)
+# MCP: non-interactive, clear LoginRequired errors
 # ---------------------------------------------------------------------------
 
 
@@ -403,8 +403,8 @@ def test_mcp_sets_noninteractive_env():
     assert os.environ.get("BALTHAZAR_TUNNEL_NONINTERACTIVE") == "1"
 
 
-def test_mcp_v3_unavailable_without_token(monkeypatch):
-    monkeypatch.setattr(blt_locator, "bridge_version", lambda: 3)
+def test_mcp_unavailable_without_token(monkeypatch):
+    monkeypatch.setattr(blt_locator, "is_tunnel", lambda: True)
     monkeypatch.setenv("BALTHAZAR_BRIDGE_URL", "https://host/app-tunnel/a/b/")
     monkeypatch.setattr(mcp_server, "_has_cached_token", lambda: False)
     schema.reset()
@@ -412,8 +412,8 @@ def test_mcp_v3_unavailable_without_token(monkeypatch):
     assert err is not None and "blt-tunnel connect" in err["error"]
 
 
-def test_mcp_v3_ready_runs_call(monkeypatch):
-    monkeypatch.setattr(blt_locator, "bridge_version", lambda: 3)
+def test_mcp_ready_runs_call(monkeypatch):
+    monkeypatch.setattr(blt_locator, "is_tunnel", lambda: True)
     monkeypatch.setenv("BALTHAZAR_BRIDGE_URL", "https://host/app-tunnel/a/b/")
     monkeypatch.setattr(mcp_server, "_has_cached_token", lambda: True)
     schema.reset()

@@ -5,20 +5,19 @@ whole `balthazar` API over the Balthazar app tunnel; a local drop-in `balthazar`
 reflects `blt.*` calls to it, so a script in your editor — breakpoints and all — reads real
 devices and writes real flow runs, behind your Balthazar login, from any laptop.
 
-The transport is the **v3 reflection bridge**. Earlier one-shot (v1) and session (v2)
-tunnels have been removed; v3 is the only path.
+The transport is the **reflection bridge**.
 
 ```
-flows/tunnel_bridge.py           the v3 server flow (stdlib-only)
+flows/tunnel_bridge.py           the server flow (stdlib-only)
 bridge/
 ├── balthazar.py                 the drop-in: `import balthazar as blt` connects from the profile
-└── balthazar_remote.py          the v3 client (Remote), extended from the remoteblt4/ prototype
+└── balthazar_remote.py          the client (Remote)
 ```
 
 The bridge **reflects** attribute access, calls, item access and context-manager use onto
 the real module on the Runner. There is no main-thread job queue and no single-owner lock;
 every call just runs `blt.*` from a worker thread. The one transport is the **Balthazar app
-tunnel**. The full interface is in [`docs/v3/SPEC.md`](docs/v3/SPEC.md).
+tunnel**. The full interface is in [`docs/SPEC.md`](docs/SPEC.md).
 
 ## Connect
 
@@ -45,7 +44,7 @@ remote = balthazar_remote.connect("https://<host>/app-tunnel/<runner>/<flow>/?sp
 `blt-tunnel connect` writes `~/.balthazar_bridge.json` (0600, **no tokens** — those stay in
 the `~/.config/balthazar/remote.json` cache). `blt_analytics._blt.get_blt()` then loads
 `bridge/balthazar.py` automatically, so `devices_df`, `runs_df`, `overview`, the
-`blt-schema` CLI and the MCP tools all run over v3 with no code change. `$BALTHAZAR_BRIDGE_URL`
+`blt-schema` CLI and the MCP tools all run over the bridge with no code change. `$BALTHAZAR_BRIDGE_URL`
 overrides the profile's URL; `blt-tunnel disconnect [--forget]` removes the profile (and,
 with `--forget`, the cached token).
 
@@ -112,7 +111,7 @@ exception leaving the block marks the run FAILED and re-raises.
 
 ## tunnel namespace
 
-On v3 the device-cache and schema helpers live under `blt.tunnel`:
+The device-cache and schema helpers live under `blt.tunnel`:
 `blt.tunnel.cached_devices(index, value)`, `blt.tunnel.cached_devices_query(device_type=…,
 keys=[…])`, `blt.tunnel.device_cache_status()`, `blt.tunnel.refresh_device_cache()`, and
 `blt.tunnel.space_schema()`. `blt.get_<index>_devices(value)` is generated from the flow's
@@ -124,7 +123,6 @@ The bridge is served over the Balthazar app tunnel, behind your login: every cal
 `X-BLT-User-Id`; browser POSTs (`Origin` / `Sec-Fetch-Site` present) are rejected; by default
 only the owner (`blt.user`, case-insensitive) and `allowed_users` may connect, and
 `shared=true` opens it to every caller the platform lets through, with a per-call audit line.
-The login client and the server-side access guards are ported from the developer prototype.
 
 ## Why naming the drop-in `balthazar` is safe
 

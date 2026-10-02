@@ -9,7 +9,7 @@ measurement value ever appears (the one exception the digest sanctions —
 timestamps in date ``first``/``last`` — is a timestamp, not a measurement). That
 boundary is what lets the tools be called freely.
 
-They all read one :func:`get_digest`. The digest is either served whole by the v3
+They all read one :func:`get_digest`. The digest is either served whole by the
 bridge (``blt.tunnel.space_schema``) or, against a real/fake Runner module, built
 locally here from fetched records via :func:`blt_analytics.digest.build_digest`.
 The local path needs record conversion, so this module carries small private
@@ -53,7 +53,7 @@ _MAX_LISTING = 100
 # Scalar leaf kinds, for default column selection in load_snippet.
 _SCALAR_KINDS = ("number", "integer", "string", "bool", "date")
 
-# v3 ``blt.tunnel.space_schema()`` builds the digest server-side and reports
+# ``blt.tunnel.space_schema()`` builds the digest server-side and reports
 # ``{state, progress, digest?}``; while it is ``building``/``empty`` we re-poll.
 # (The Remote may also poll internally; this loop is harmless either way and makes
 # the schema layer correct against a bridge that returns the raw state.) Both are
@@ -89,7 +89,7 @@ def get_digest(refresh: bool = False) -> dict:
     """Return the space digest, memoized.
 
     Call order: an injected digest wins (tests); otherwise the memoized one unless
-    ``refresh``; otherwise it is built. When the located module is the v3 bridge its
+    ``refresh``; otherwise it is built. When the located module is the bridge its
     ``blt.tunnel.space_schema(refresh)`` serves the digest directly (polled until
     ready); if that op is unavailable (a bridge too old — ``AttributeError``) or the
     module is a real/fake Runner, the digest is built locally from fetched records.
@@ -109,10 +109,10 @@ def get_digest(refresh: bool = False) -> dict:
 
 def _acquire_digest(refresh: bool) -> dict:
     blt = _blt.get_blt()
-    ns = _blt.tunnel_ns()  # the v3 tunnel namespace, or None (real Runner)
+    ns = _blt.tunnel_ns()  # the tunnel namespace, or None (real Runner)
     if ns is not None:
         try:
-            return _v3_space_schema(ns, refresh)
+            return _space_schema_via_tunnel(ns, refresh)
         except AttributeError:
             # Bridge predates ``tunnel.space_schema``: build locally from the read
             # surface. A server-side build *error* is surfaced (RuntimeError), not
@@ -122,7 +122,7 @@ def _acquire_digest(refresh: bool) -> dict:
     return _digest_mod.build_digest(devices, flows, runs)
 
 
-def _v3_space_schema(ns: Any, refresh: bool) -> dict:
+def _space_schema_via_tunnel(ns: Any, refresh: bool) -> dict:
     """The space digest via ``blt.tunnel.space_schema()``, polling until ``ready``.
 
     ``space_schema(refresh=False)`` returns ``{state, progress, digest?}``. The
@@ -344,7 +344,7 @@ def overview() -> dict:
     flow with its run count and date range. Schema only; take exact device-type and
     flow names from here, then narrow with the other tools.
 
-    On the v3 bridge it also reports ``device_indexes`` (``{name: dotted path}``)
+    On the bridge it also reports ``device_indexes`` (``{name: dotted path}``)
     when the flow configures a server-side device cache (SPEC §6) — the index names
     to pass to ``devices_df(index=..., value=...)``. Names and paths only, never
     index values.
@@ -378,7 +378,7 @@ def overview() -> dict:
         out["flows_truncated"] = dropped_flows
 
     # Configured server-side device indexes (names + dotted paths only — schema, no
-    # values), from the v3 ``describe`` reply (SPEC §6). Skipped when a digest is
+    # values), from the ``describe`` reply (SPEC §6). Skipped when a digest is
     # injected (tests), so the pure-digest tools stay offline and deterministic.
     if _injected is None:
         indexes = _device_indexes_from_describe()
@@ -390,14 +390,14 @@ def overview() -> dict:
 def _device_indexes_from_describe() -> dict:
     """``{index_name: dotted_path}`` for the configured device indexes, or ``{}``.
 
-    On the v3 bridge, the index names/paths come from the ``describe`` reply's
+    On the bridge, the index names/paths come from the ``describe`` reply's
     ``device_indexes`` (``_blt.describe_info()``). Anything that goes wrong (not a
     bridge, no connection, a malformed reply) collapses to ``{}`` so ``overview``
     never fails over it. Only names and paths surface — never index *values*, which
     are device data.
     """
     try:
-        if _blt.bridge_version() != 3:
+        if not _blt.is_tunnel():
             return {}
         info = _blt.describe_info() or {}
     except Exception:  # noqa: BLE001 - offline / no bridge -> nothing to add

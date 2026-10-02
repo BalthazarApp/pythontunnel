@@ -1,4 +1,4 @@
-"""Shared helpers for the v3 bridge tests (imported by the tests and the conftest).
+"""Shared helpers for the bridge tests (imported by the tests and the conftest).
 
 ``Client`` is a tiny stdlib HTTP caller that drives the bridge's ``/call`` endpoint
 directly: it sends ``X-BLT-User-Id`` itself (the auth-bypassed transport the spec
@@ -18,7 +18,7 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 BRIDGE_PATH = os.path.join(REPO, "flows", "tunnel_bridge.py")
-REMOTE_CLIENT_PATH = os.path.join(REPO, "remoteblt4", "balthazar_remote.py")
+REMOTE_CLIENT_PATH = os.path.join(REPO, "bridge", "balthazar_remote.py")
 
 OWNER = "owner-user"
 _UNSET = object()
@@ -88,8 +88,8 @@ class Client:
 
 
 def load_remote_client():
-    """Import ``remoteblt4/balthazar_remote.py`` by path (the wire-compat client)."""
-    spec = importlib.util.spec_from_file_location("remoteblt4_client", REMOTE_CLIENT_PATH)
+    """Import the client (``bridge/balthazar_remote.py``) by path."""
+    spec = importlib.util.spec_from_file_location("bridge_remote_client", REMOTE_CLIENT_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

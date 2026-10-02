@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Live smoke test for the Balthazar v3 reflection bridge.
+"""Live smoke test for the Balthazar reflection bridge.
 
 Exercises the real bridge end-to-end from the client side: it locates the balthazar
 module exactly the way ``blt_analytics`` does (via ``blt_analytics._blt.get_blt()``),
-confirms it is the **v3 bridge** (``bridge_version() == 3``), and runs a sequence of
+confirms it is the **bridge** (``is_tunnel()``), and runs a sequence of
 numbered checks against the running flow. Tunnel ops live under ``blt.tunnel`` and
 identity comes from ``describe``.
 
@@ -88,7 +88,7 @@ class State:
 
     def __init__(self) -> None:
         self.blt: Any = None
-        self.version: Optional[int] = None  # 3 (bridge) or None (runner)
+        self.is_bridge: bool = False  # True for the bridge, False for a runner
         self.describe: Optional[dict] = None
         self.device_indexes: dict[str, str] = {}
         self.sample_devices: list = []
@@ -111,7 +111,7 @@ def _require_describe(state: State) -> None:
 
 
 def _describe(state: State) -> dict:
-    """The v3 ``describe`` payload (``blt._session.description``), or ``{}``."""
+    """The ``describe`` payload (``blt._session.description``), or ``{}``."""
     from blt_analytics import _blt
 
     return _blt.describe_info() or {}
@@ -277,7 +277,7 @@ def check_device_cache_index(state: State, args: argparse.Namespace) -> str:
     if value is _MISSING:
         raise SkipCheck(f"no sampled device had a value at index path {path!r}")
 
-    # ``get_<index>_devices`` is generated on the v3 drop-in; ``cached_devices`` lives
+    # ``get_<index>_devices`` is generated on the drop-in; ``cached_devices`` lives
     # under ``blt.tunnel``.
     accessor = getattr(state.blt, f"get_{index_name}_devices")
     t0 = time.perf_counter()
@@ -439,7 +439,7 @@ def check_write_nested_fail(state: State) -> str:
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="smoke_test_tunnel.py",
-        description="Live smoke test for the Balthazar v3 reflection bridge "
+        description="Live smoke test for the Balthazar reflection bridge "
                     "(read-only unless --write).",
     )
     p.add_argument("--write", action="store_true",
@@ -467,25 +467,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"Balthazar bridge smoke test — mode: {mode}", flush=True)
 
     # Locate the balthazar module exactly as blt_analytics does. get_blt() prefers an
-    # importable real module / v3 drop-in, otherwise loads the v3 bridge by profile.
+    # importable real module / drop-in, otherwise loads the bridge by profile.
     try:
         from blt_analytics import _blt
         state.blt = _blt.get_blt()
-        state.version = _blt.bridge_version()
+        state.is_bridge = _blt.is_tunnel()
     except Exception as exc:  # noqa: BLE001
         print(f"[FAIL]  0. locate balthazar module  {type(exc).__name__}: {exc}", flush=True)
         print("\n0 passed, 1 failed, 0 skipped", flush=True)
         return 1
-    label = "v3 reflection bridge" if state.version == 3 else "real runner module"
+    label = "reflection bridge" if state.is_bridge else "real runner module"
     print(
         f"        located balthazar: {label} "
         f"({getattr(state.blt, '__file__', '?')})",
         flush=True,
     )
 
-    if state.version != 3:
+    if not state.is_bridge:
         print(
-            "[FAIL]  0. this smoke test needs the v3 bridge, but located "
+            "[FAIL]  0. this smoke test needs the bridge, but located "
             f"{label}. Run `blt-tunnel connect \"<url>\"` first.",
             flush=True,
         )

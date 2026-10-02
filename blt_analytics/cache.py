@@ -128,7 +128,7 @@ def space_key(blt: Any = None) -> str:
 
     The choice, documented because the spec left it open (§4 cache):
 
-    1. on the **v3 bridge**, a hash of the bridge URL plus a root id from
+    1. on the **bridge**, a hash of the bridge URL plus a root id from
        ``describe`` (flow run, else the owner). The endpoint + root pins the space a
        bridge is attached to without a measurement value ever entering the key. The
        bridge is checked first because a reflected ``blt.space`` would otherwise

@@ -1,5 +1,5 @@
-"""v3 bridge server tests: auth, protocol, ops, hardening, refs, jobs, watchdog,
-audit, parts, and wire compatibility with remoteblt4's own client.
+"""Bridge server tests: auth, protocol, ops, hardening, refs, jobs, watchdog,
+audit, parts, and wire compatibility with the client.
 
 The handler runs for real on a loopback socket; the fake *real* ``balthazar`` is
 injected, and a :class:`Client` drives the wire protocol directly.
@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 import zlib
 
-from v3._helpers import OWNER, load_remote_client
+from bridge._helpers import OWNER, load_remote_client
 
 
 def _incompressible(nbytes: int) -> str:
@@ -427,7 +427,7 @@ def test_poll_reply_is_itself_split(bridge_server, client_factory, fake_blt, mon
 
 
 # ---------------------------------------------------------------------------
-# Wire compatibility with remoteblt4's own client (_Protocol driven directly)
+# Wire compatibility: the client's _Protocol driven directly
 # ---------------------------------------------------------------------------
 
 

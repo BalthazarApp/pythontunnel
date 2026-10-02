@@ -1,14 +1,14 @@
-"""Fixtures for the v3 bridge tests.
+"""Fixtures for the bridge tests.
 
 Every test runs the real HTTP handler from ``flows/tunnel_bridge.py`` on
 ``127.0.0.1:0`` with the fake *real* ``balthazar`` injected as
-``sys.modules["balthazar"]``. The flow module is imported *fresh* per test (as the
-v2 server tests do), so its ``import balthazar as blt`` binds the fake and its
+``sys.modules["balthazar"]``. The flow module is imported *fresh* per test, so its
+``import balthazar as blt`` binds the fake and its
 module-level state — refs, device cache, schema cache — starts clean, and the
 import-time ``_audit_info = blt.info`` capture points at the fake's logger.
 
 The ``bridge_server`` factory stands up the handler with a chosen set of flow
-params and returns ``(url, module)``; tests build a :class:`v3._helpers.Client`
+params and returns ``(url, module)``; tests build a :class:`bridge._helpers.Client`
 against that url (the auth-bypassed transport the spec calls for).
 """
 
@@ -22,7 +22,7 @@ from http.server import ThreadingHTTPServer
 import pytest
 
 from fakes import fake_blt as _fake_blt_module
-from v3._helpers import BRIDGE_PATH, OWNER, Client
+from bridge._helpers import BRIDGE_PATH, OWNER, Client
 
 
 @pytest.fixture

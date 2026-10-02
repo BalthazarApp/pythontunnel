@@ -1,4 +1,4 @@
-"""True end-to-end tests: the real v3 server + the real v3 client, in one process.
+"""True end-to-end tests: the real server + the real client, in one process.
 
 Unlike ``test_bridge_client.py`` (real client vs. a hand-written fake bridge) and
 ``test_bridge_server.py`` (real server vs. a raw HTTP caller), every test here wires
@@ -33,7 +33,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from v3._helpers import OWNER, Client  # noqa: E402
+from bridge._helpers import OWNER, Client  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(_HERE))
 CLIENT_PATH = os.path.join(REPO, "bridge", "balthazar_remote.py")
@@ -45,7 +45,7 @@ MIB = 1024 * 1024
 # Loading / connecting the real client
 # ---------------------------------------------------------------------------
 def _load_client():
-    """Import the real v3 client (``bridge/balthazar_remote.py``) by path, with the
+    """Import the real client (``bridge/balthazar_remote.py``) by path, with the
     stderr-notice / tunnel-poll delays turned down so the tests stay fast."""
     spec = importlib.util.spec_from_file_location("bridge_balthazar_remote_e2e", CLIENT_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -297,14 +297,13 @@ def dropin(monkeypatch, tmp_path):
     blt_locator._reset_test_bridges()
 
 
-def test_dropin_get_blt_classifies_as_v3(bridge_server, fake_blt, dropin):
+def test_dropin_get_blt_classifies_as_bridge(bridge_server, fake_blt, dropin):
     import blt_analytics._blt as blt_locator
 
     url, _ = bridge_server()
     module = dropin(url)
     assert module.__balthazar_tunnel__ == 3
     assert blt_locator.is_tunnel() is True
-    assert blt_locator.bridge_version() == 3
     desc = blt_locator.describe_info()
     assert desc.get("owner") == OWNER and desc.get("protocol") == 3
 
@@ -344,7 +343,7 @@ def test_dropin_schema_overview_via_space_schema(bridge_server, fake_blt, dropin
     assert out["device_indexes"] == {"wafer": "hierarchy.wafer"}
 
 
-def test_dropin_doctor_reports_v3_bridge(bridge_server, fake_blt, dropin, tmp_path, capsys):
+def test_dropin_doctor_reports_bridge(bridge_server, fake_blt, dropin, tmp_path, capsys):
     from blt_analytics import cli
 
     home = tmp_path / "home"
@@ -361,7 +360,7 @@ def test_dropin_doctor_reports_v3_bridge(bridge_server, fake_blt, dropin, tmp_pa
     project.mkdir()
     cli.run_doctor(project=str(project), home=str(home))
     out = capsys.readouterr().out
-    assert "[PASS] bridge: v3 reflection bridge" in out
+    assert "[PASS] bridge: reflection bridge" in out
     assert "[PASS] describe:" in out and OWNER in out
     assert "[PASS] space_schema:" in out
 

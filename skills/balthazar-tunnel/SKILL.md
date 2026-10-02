@@ -1,9 +1,9 @@
 ---
 name: balthazar-tunnel
-description: Run local Python against live Balthazar space data through the v3 reflection bridge (bridge/balthazar.py, blt-tunnel connect, app tunnel only, behind your Balthazar login). Open flow-run contexts with enter_new_flow_run, capture plt.show() figures onto the open run, write run outputs (blt.output) and device params (params.update). Covers connecting (blt-tunnel connect/disconnect/doctor, balthazar_remote.connect/connect_from_profile, the bridge profile ~/.balthazar_bridge.json), the blt.tunnel namespace (cached_devices, cached_devices_query, device_cache_status, refresh_device_cache, space_schema), v3 limits (long calls polled, large payloads as parts, sibling-only nesting, heartbeat vs debugger pauses, shared-mode runs as owner, secrets hidden), what is not tunnelled (blt.secrets, blt.context), and portability to the real Runner. Triggers include: reflection bridge, v3 bridge, remote tunnel, app tunnel, blt-tunnel connect, balthazar_remote, connect from a laptop, device-code login, enter_new_flow_run, nested flow runs, plt.show not saving to a run, device.params.update, run stuck in RUNNING, balthazar.py drop-in, blt.tunnel, "debug a flow locally against real data".
+description: Run local Python against live Balthazar space data through the reflection bridge (bridge/balthazar.py, blt-tunnel connect, app tunnel only, behind your Balthazar login). Open flow-run contexts with enter_new_flow_run, capture plt.show() figures onto the open run, write run outputs (blt.output) and device params (params.update). Covers connecting (blt-tunnel connect/disconnect/doctor, balthazar_remote.connect/connect_from_profile, the bridge profile ~/.balthazar_bridge.json), the blt.tunnel namespace (cached_devices, cached_devices_query, device_cache_status, refresh_device_cache, space_schema), bridge limits (long calls polled, large payloads as parts, sibling-only nesting, heartbeat vs debugger pauses, shared-mode runs as owner, secrets hidden), what is not tunnelled (blt.secrets, blt.context), and portability to the real Runner. Triggers include: reflection bridge, remote tunnel, app tunnel, blt-tunnel connect, balthazar_remote, connect from a laptop, device-code login, enter_new_flow_run, nested flow runs, plt.show not saving to a run, device.params.update, run stuck in RUNNING, balthazar.py drop-in, blt.tunnel, "debug a flow locally against real data".
 ---
 
-# Balthazar tunnel — v3 reflection bridge
+# Balthazar tunnel — reflection bridge
 
 Debug local Python against live Balthazar data. A flow running on the Runner serves the
 whole `balthazar` API over the Balthazar app tunnel; a local drop-in `balthazar` module
@@ -17,15 +17,15 @@ pandas and plot), use the **balthazar-analytics** skill instead — it builds on
 
 ## The reflection bridge
 
-v3 is a **generic reflection bridge** (ported from the `remoteblt4/` developer prototype).
-It has no main-thread job queue and no single-owner lock — every call just runs `blt.*` from
-a worker thread — and its only transport is the **Balthazar app tunnel**, so it always works
-behind your login, from any laptop.
+The bridge is a **generic reflection bridge**. It has no main-thread job queue and no
+single-owner lock — every call just runs `blt.*` from a worker thread — and its only
+transport is the **Balthazar app tunnel**, so it always works behind your login, from any
+laptop.
 
 ```
-flows/tunnel_bridge.py           the v3 server flow (stdlib-only)
+flows/tunnel_bridge.py           the server flow (stdlib-only)
 bridge/balthazar.py              the drop-in: `import balthazar as blt` connects from the profile
-bridge/balthazar_remote.py       the v3 client (Remote)
+bridge/balthazar_remote.py       the client (Remote)
 ```
 
 ## Connect
@@ -251,7 +251,7 @@ same       = blt.tunnel.cached_devices("wafer", "W123")   # the generic form
 
 Code you debug here deploys to the Runner unchanged. One caveat: the device-cache ops
 (`blt.tunnel.*`, `get_<index>_devices`) and `blt.tunnel.space_schema()` are **tunnel-only** —
-the real Runner has none of them. There is **no `search_devices` projection** on v3 either:
+the real Runner has none of them. There is **no `search_devices` projection** on the bridge either:
 the bridge forwards straight to the real Runner, which has no `keys=`/`scalars_only=` kwargs.
 For portable code:
 

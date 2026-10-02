@@ -1,6 +1,5 @@
-"""v3 bridge tunnel-namespace tests: the server-side device cache and space_schema,
-ported from the v2 session server §6 and driven here through the ``tunnel`` op over
-real HTTP.
+"""Bridge tunnel-namespace tests: the server-side device cache and space_schema,
+driven through the ``tunnel`` op over real HTTP.
 """
 
 from __future__ import annotations
@@ -10,7 +9,7 @@ import json
 import os
 import time
 
-from v3._helpers import BRIDGE_PATH, OWNER
+from bridge._helpers import BRIDGE_PATH, OWNER
 
 INDEXES = json.dumps({"by_wafer": {"path": "hierarchy.wafer", "device_type": "Chip"}})
 

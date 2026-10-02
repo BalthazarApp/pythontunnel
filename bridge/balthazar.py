@@ -1,4 +1,4 @@
-"""Drop-in ``balthazar`` module backed by the v3 remote bridge.
+"""Drop-in ``balthazar`` module backed by the remote bridge.
 
 With this directory on ``sys.path`` (or while running from it), ``import balthazar
 as blt`` connects to the bridge described by ``~/.balthazar_bridge.json`` (or
@@ -8,10 +8,8 @@ reads exactly as a flow script would.
 
 On a Runner this file never wins: the real module is registered as a *builtin* via
 ``pyo3::append_to_inittab!`` and CPython's ``BuiltinImporter`` is consulted before
-the path finder. ``__balthazar_tunnel__ = 3`` marks this as the v3 shim so
-``blt_analytics`` can tell the three transports apart.
-
-Credits ``remoteblt4/`` (the parts protocol and reflection client this builds on).
+the path finder. ``__balthazar_tunnel__ = 3`` marks this as the bridge drop-in so
+``blt_analytics`` can tell it apart from the real Runner module.
 """
 
 import importlib.util

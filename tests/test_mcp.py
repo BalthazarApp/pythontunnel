@@ -47,7 +47,7 @@ def server():
 
 
 def _await(value):
-    """Resolve a value that may be a coroutine (mcp v2 methods are async)."""
+    """Resolve a value that may be a coroutine (mcp 2.x methods are async)."""
     if inspect.isawaitable(value):
         return asyncio.run(value)
     return value
@@ -72,7 +72,7 @@ def test_all_tools_registered(server):
 def test_tools_have_model_facing_descriptions(server):
     for tool in _list_tools(server):
         assert tool.description and tool.description.strip()
-        # input_schema is a JSON-schema object (snake_case in v2, camelCase in v1).
+        # input_schema is a JSON-schema object (snake_case in mcp 2.x, camelCase in mcp 1.x).
         schema_obj = getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None)
         assert isinstance(schema_obj, dict)
     overview = next(t for t in _list_tools(server) if t.name == "overview")

@@ -1,4 +1,4 @@
-"""Schema-only analytics over the Balthazar v2 session tunnel.
+"""Schema-only analytics over the Balthazar reflection bridge.
 
 The public API is re-exported lazily (PEP 562 ``__getattr__``) for two reasons:
 

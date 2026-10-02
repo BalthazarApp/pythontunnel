@@ -1,14 +1,12 @@
-"""v3 remote bridge server: a generic reflection bridge over the app tunnel.
+"""Remote bridge server: a generic reflection bridge over the app tunnel.
 
-This is the v3 server flow. It serves the whole ``balthazar`` Python API to a remote
+This is the server flow. It serves the whole ``balthazar`` Python API to a remote
 client through the Balthazar app tunnel, by reflecting attribute access, calls,
 item access and context-manager use onto the real module running on the Runner.
 
 The wire format, the value tags (``$obj`` / ``$ref`` / ``$attr`` / ``$new`` / …) and
 the *parts protocol* (2 MiB zlib-compressed chunks, split and stitched in both
-directions) are taken verbatim from ``remoteblt4/app/bridge.py`` so this server and
-``remoteblt4``'s own client stay wire-compatible. Credit to that prototype; this file
-keeps its structure and style and adds, per ``docs/v3/SPEC.md``:
+directions) give the client a stable wire contract. Per ``docs/SPEC.md`` the server:
 
 * ``describe`` reports protocol 3, bridge version, user/owner/shared, the tunnel
   function names, the device indexes and the idle/call timeouts;
@@ -58,7 +56,7 @@ PART_TTL = 300
 JOB_TTL = 600.0                      # finished, unpolled jobs expire after 10 min
 DEFAULT_PART_BYTES = 2 * 1024 * 1024
 
-# Device-cache paging constants (ported from v2 §6).
+# Device-cache paging constants.
 DEVICE_PAGE_SIZE = 1000
 DEVICE_REFRESH_CHUNK = 500
 RUN_PAGE_SIZE = 250
@@ -220,7 +218,7 @@ def release_refs(state, refs):
 
 
 # ----------------------------------------------------------------------------
-# Parts protocol (download + upload), verbatim from remoteblt4, per caller.
+# Parts protocol (download + upload), per caller.
 # ----------------------------------------------------------------------------
 _transfers: dict = {}
 _transfers_lock = threading.Lock()
@@ -276,7 +274,7 @@ def add_part(caller, token, index, count, data):
 
 
 # ----------------------------------------------------------------------------
-# Encoding / decoding (verbatim from remoteblt4, with ModuleType refused).
+# Encoding / decoding (ModuleType refused).
 # ----------------------------------------------------------------------------
 def describe(value):
     try:
@@ -666,7 +664,7 @@ def _watchdog_loop(stop):
 
 
 # ----------------------------------------------------------------------------
-# Serialization helpers (ported from v2 §1 / §6).
+# Serialization helpers.
 # ----------------------------------------------------------------------------
 def _params_to_dict(params):
     for attempt in (lambda: dict(params),
@@ -755,7 +753,7 @@ def _run_to_dict(run):
 
 
 # ----------------------------------------------------------------------------
-# Device cache (ported from v2 §6; no main-thread queue, so blt.* is called direct).
+# Device cache (no main-thread queue, so blt.* is called direct).
 # ----------------------------------------------------------------------------
 _device_store = {"records": {}, "index": {}, "built_at": None}
 _cache_meta = {
@@ -1094,7 +1092,7 @@ def _start_device_cache_load_async():
 
 
 # ----------------------------------------------------------------------------
-# space_schema (ported from v2 §6/§7; builds the digest in the background).
+# space_schema (builds the digest in the background).
 # ----------------------------------------------------------------------------
 _schema_cache = {"digest": None}
 _schema_build = {

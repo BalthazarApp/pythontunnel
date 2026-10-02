@@ -4,16 +4,16 @@ Two modules can answer to the name ``balthazar`` in this repo:
 
 * the **real** Runner module — injected as a builtin on a Balthazar Runner, with
   no ``__balthazar_tunnel__`` marker;
-* the **v3 reflection bridge drop-in** (``bridge/balthazar.py``) — marked
+* the **bridge drop-in** (``bridge/balthazar.py``) — marked
   ``__balthazar_tunnel__ = 3``; a PEP 562 module that lazily connects from the
-  saved profile and delegates to a ``Remote``. Its tunnel helpers live under a
-  single ``blt.tunnel`` namespace (``cached_devices``, ``cached_devices_query``,
+  saved profile and delegates to a ``Remote``. Its helpers live under a single
+  ``blt.tunnel`` namespace (``cached_devices``, ``cached_devices_query``,
   ``device_cache_status``, ``refresh_device_cache``, ``space_schema``). This is the
   only transport.
 
 ``get_blt`` returns, in order: an importable ``balthazar`` that is the real module
-or the v3 drop-in; else — when a v3 profile exists (``~/.balthazar_bridge.json`` or
-``$BALTHAZAR_BRIDGE_URL``) — the v3 drop-in loaded by path from ``$BLT_BRIDGE_DIR``
+or the bridge drop-in; else — when a bridge profile exists (``~/.balthazar_bridge.json``
+or ``$BALTHAZAR_BRIDGE_URL``) — the drop-in loaded by path from ``$BLT_BRIDGE_DIR``
 or ``<repo>/bridge/balthazar.py``. If nothing can be located it raises, so a
 misconfiguration fails fast instead of silently losing the API.
 """
@@ -26,23 +26,23 @@ import os
 import sys
 from types import ModuleType
 
-__all__ = ["get_blt", "is_tunnel", "bridge_version", "tunnel_ns", "describe_info"]
+__all__ = ["get_blt", "is_tunnel", "tunnel_ns", "describe_info"]
 
-# v3 drop-ins loaded off disk are cached by resolved path. The drop-in holds live
+# Drop-ins loaded off disk are cached by resolved path. The drop-in holds live
 # state (the open-context stack, the patched ``plt.show``), so re-executing the file
-# on every call would quietly reset it — load once, reuse. An importable real/v3
-# module is *not* cached here: it already lives in ``sys.modules``, and skipping the
-# cache lets a test swap it in and out via ``sys.modules`` and see the change.
+# on every call would quietly reset it — load once, reuse. An importable module is
+# *not* cached here: it already lives in ``sys.modules``, and skipping the cache lets
+# a test swap it in and out via ``sys.modules`` and see the change.
 _PATH_SHIMS: dict[str, ModuleType] = {}
 
 
 def _classify(module: ModuleType) -> str:
-    """One of ``"v3"`` or ``"real"`` for a candidate module.
+    """One of ``"bridge"`` or ``"real"`` for a candidate module.
 
-    The v3 marker is the *integer* ``3``; anything else (including no marker) is a
-    real Runner module.
+    The bridge marker is the *integer* ``3``; anything else (including no marker)
+    is a real Runner module.
     """
-    return "v3" if getattr(module, "__balthazar_tunnel__", False) == 3 else "real"
+    return "bridge" if getattr(module, "__balthazar_tunnel__", False) == 3 else "real"
 
 
 def _try_import_balthazar() -> ModuleType | None:
@@ -50,7 +50,7 @@ def _try_import_balthazar() -> ModuleType | None:
 
     Goes through ``importlib`` so a test that injects ``sys.modules["balthazar"]``
     is honoured. Any failure (nothing importable, a broken module) is swallowed —
-    the caller falls back to loading the v3 drop-in by path.
+    the caller falls back to loading the bridge drop-in by path.
     """
     try:
         return importlib.import_module("balthazar")
@@ -59,12 +59,12 @@ def _try_import_balthazar() -> ModuleType | None:
 
 
 # ---------------------------------------------------------------------------
-# v3 reflection bridge drop-in (SPEC "blt_analytics integration")
+# Reflection bridge drop-in (SPEC "blt_analytics integration")
 # ---------------------------------------------------------------------------
 
 
 def _bridge_dir() -> str:
-    """Directory holding the v3 drop-in: ``$BLT_BRIDGE_DIR`` or ``<repo>/bridge``."""
+    """Directory holding the drop-in: ``$BLT_BRIDGE_DIR`` or ``<repo>/bridge``."""
     override = os.environ.get("BLT_BRIDGE_DIR")
     if override:
         return os.path.abspath(os.path.expanduser(override))
@@ -74,27 +74,27 @@ def _bridge_dir() -> str:
 
 
 def _bridge_profile_path() -> str:
-    """The v3 connection profile written by ``blt-tunnel connect`` / ``save_profile``."""
+    """The connection profile written by ``blt-tunnel connect`` / ``save_profile``."""
     return os.path.join(os.path.expanduser("~"), ".balthazar_bridge.json")
 
 
-def _v3_profile_present() -> bool:
-    """Whether a v3 bridge is configured (profile file or ``$BALTHAZAR_BRIDGE_URL``)."""
+def _bridge_profile_present() -> bool:
+    """Whether a bridge is configured (profile file or ``$BALTHAZAR_BRIDGE_URL``)."""
     if os.environ.get("BALTHAZAR_BRIDGE_URL"):
         return True
     return os.path.exists(_bridge_profile_path())
 
 
-def _try_v3_bridge() -> ModuleType | None:
-    """Load the v3 drop-in by path when a bridge profile/env is configured.
+def _try_bridge() -> ModuleType | None:
+    """Load the drop-in by path when a bridge profile/env is configured.
 
     Returns the module only when (a) a profile or ``$BALTHAZAR_BRIDGE_URL`` exists,
     (b) ``<bridge_dir>/balthazar.py`` is present and imports, and (c) it classifies
-    as v3. Otherwise ``None``. The drop-in's own sibling imports (``balthazar_remote``)
-    need ``bridge_dir`` on ``sys.path``, so it is prepended before the module is
-    executed.
+    as the bridge. Otherwise ``None``. The drop-in's own sibling imports
+    (``balthazar_remote``) need ``bridge_dir`` on ``sys.path``, so it is prepended
+    before the module is executed.
     """
-    if not _v3_profile_present():
+    if not _bridge_profile_present():
         return None
     bridge_dir = _bridge_dir()
     path = os.path.join(bridge_dir, "balthazar.py")
@@ -104,7 +104,7 @@ def _try_v3_bridge() -> ModuleType | None:
         return None
     if bridge_dir not in sys.path:
         sys.path.insert(0, bridge_dir)
-    spec = importlib.util.spec_from_file_location("blt_analytics._v3_bridge", path)
+    spec = importlib.util.spec_from_file_location("blt_analytics._bridge", path)
     if spec is None or spec.loader is None:
         return None
     module = importlib.util.module_from_spec(spec)
@@ -112,14 +112,14 @@ def _try_v3_bridge() -> ModuleType | None:
         spec.loader.exec_module(module)
     except Exception:  # noqa: BLE001 - a broken drop-in must not kill analytics
         return None
-    if _classify(module) != "v3":
+    if _classify(module) != "bridge":
         return None
     _PATH_SHIMS[path] = module
     return module
 
 
 # ---------------------------------------------------------------------------
-# Test-only override: a v3 drop-in pre-connected to a local bridge over the
+# Test-only override: a drop-in pre-connected to a local bridge over the
 # client's documented ``_test_base_url`` hook. Active only when the environment
 # variable below is set (the E2E tests set it); a no-op in production.
 # ---------------------------------------------------------------------------
@@ -129,7 +129,7 @@ _test_bridges: dict[tuple, ModuleType] = {}
 
 
 def _bridge_from_test_env() -> ModuleType | None:
-    """The v3 drop-in connected to ``$BLT_BRIDGE_TEST_BASE_URL`` (tests), else ``None``.
+    """The drop-in connected to ``$BLT_BRIDGE_TEST_BASE_URL`` (tests), else ``None``.
 
     When the env var is set, load ``<bridge_dir>/balthazar.py`` by path and inject a
     ``Remote`` connected through the client's login-free test transport
@@ -153,12 +153,12 @@ def _bridge_from_test_env() -> ModuleType | None:
         return None
     if bridge_dir not in sys.path:
         sys.path.insert(0, bridge_dir)
-    spec = importlib.util.spec_from_file_location("blt_analytics._v3_bridge_test", path)
+    spec = importlib.util.spec_from_file_location("blt_analytics._bridge_test", path)
     if spec is None or spec.loader is None:
         return None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    if _classify(module) != "v3":
+    if _classify(module) != "bridge":
         return None
     remote_mod = module._load_remote_module()
     module._remote = remote_mod.connect(_test_base_url=base, _test_user_id=user)
@@ -179,8 +179,8 @@ def _reset_test_bridges() -> None:
 def get_blt() -> ModuleType:
     """Return the balthazar module the analytics code should call.
 
-    Order (SPEC "blt_analytics integration"): an importable real module or v3
-    drop-in; else the v3 drop-in loaded by path when a bridge profile exists. Raises
+    Order (SPEC "blt_analytics integration"): an importable real module or bridge
+    drop-in; else the drop-in loaded by path when a bridge profile exists. Raises
     ``RuntimeError`` if no balthazar module can be located at all.
     """
     test_bridge = _bridge_from_test_env()
@@ -189,47 +189,35 @@ def get_blt() -> ModuleType:
     imported = _try_import_balthazar()
     if imported is not None:
         return imported
-    v3 = _try_v3_bridge()
-    if v3 is not None:
-        return v3
+    bridge = _try_bridge()
+    if bridge is not None:
+        return bridge
     raise RuntimeError(
         "No balthazar module is reachable: neither an importable 'balthazar' (a real "
-        "Runner module) nor the v3 reflection bridge. Run `blt-tunnel connect "
+        "Runner module) nor the reflection bridge. Run `blt-tunnel connect "
         '"<app url>"` to configure the bridge (writes ~/.balthazar_bridge.json), or '
         "run on a Balthazar Runner."
     )
 
 
 def is_tunnel() -> bool:
-    """Whether the located module is the v3 bridge drop-in (not a real Runner module).
+    """Whether the located module is the bridge drop-in (not a real Runner module).
 
     On a real Runner this is ``False``, and callers must not use bridge-only features
     (the ``blt.tunnel`` namespace).
     """
     try:
-        return _classify(get_blt()) == "v3"
+        return _classify(get_blt()) == "bridge"
     except Exception:  # noqa: BLE001 - no module located -> not a tunnel
         return False
 
 
-def bridge_version() -> int | None:
-    """``3`` for the v3 drop-in, else ``None`` (real Runner, or nothing located).
+def _tunnel_namespace(module: ModuleType) -> object | None:
+    """The ``blt.tunnel`` namespace if ``module`` exposes one, else ``None``.
 
-    Never raises: if no balthazar module can be located at all it returns ``None``.
-    """
-    try:
-        module = get_blt()
-    except Exception:  # noqa: BLE001 - "no bridge" reads as "no version"
-        return None
-    return 3 if _classify(module) == "v3" else None
-
-
-def _v3_tunnel_namespace(module: ModuleType) -> object | None:
-    """The v3 ``blt.tunnel`` namespace if ``module`` exposes one, else ``None``.
-
-    Duck-typed rather than keyed off :func:`bridge_version` so the analytics tests
-    can drive it with a plain stub object (no file loading). A v3 tunnel namespace
-    resolves its functions dynamically, so probing one attribute is enough.
+    Duck-typed rather than keyed off the marker so the analytics tests can drive it
+    with a plain stub object (no file loading). A tunnel namespace resolves its
+    functions dynamically, so probing one attribute is enough.
     """
     try:
         ns = getattr(module, "tunnel", None)
@@ -247,16 +235,16 @@ def _v3_tunnel_namespace(module: ModuleType) -> object | None:
 def tunnel_ns():
     """Return the located module's ``blt.tunnel`` namespace, or ``None`` (real Runner)."""
     try:
-        return _v3_tunnel_namespace(get_blt())
+        return _tunnel_namespace(get_blt())
     except Exception:  # noqa: BLE001
         return None
 
 
 def describe_from_object(obj: object) -> dict:
-    """Best-effort v3 ``describe`` payload (dict) from a Remote or drop-in, or ``{}``.
+    """Best-effort ``describe`` payload (dict) from a Remote or drop-in, or ``{}``.
 
     The real client (``bridge/balthazar_remote.py``) stores its ``describe`` reply on
-    the ``Remote`` as ``remote._description`` (see ``Remote.__init__``). The v3 drop-in
+    the ``Remote`` as ``remote._description`` (see ``Remote.__init__``). The drop-in
     delegates attribute access to that Remote, so ``blt._description`` reaches it. A few
     other shapes are tried defensively afterwards (an older ``_session.description``,
     a ``.describe()`` method, ``_describe``); every access is guarded so a caller never
@@ -285,11 +273,11 @@ def describe_from_object(obj: object) -> dict:
 
 
 def describe_info() -> dict:
-    """The v3 ``describe`` payload for the located drop-in, or ``{}`` (real Runner)."""
+    """The ``describe`` payload for the located drop-in, or ``{}`` (real Runner)."""
     try:
         module = get_blt()
     except Exception:  # noqa: BLE001
         return {}
-    if _classify(module) != "v3":
+    if _classify(module) != "bridge":
         return {}
     return describe_from_object(module)

@@ -6,7 +6,7 @@ and returns the new ``flow_run_id``. It leans on the environment's existing
 ``plt.show`` capture rather than uploading anything itself, so the same call works
 both ways:
 
-* on the **v3 bridge**, ``plt.show()`` inside an open context uploads the open
+* on the **bridge**, ``plt.show()`` inside an open context uploads the open
   figures it has not already sent;
 * on a **real Runner**, the Balthazar matplotlib backend captures ``plt.show()``.
 

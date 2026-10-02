@@ -1,8 +1,8 @@
-"""v3 client tests against an in-process protocol-3 fake bridge.
+"""Client tests against an in-process protocol-3 fake bridge.
 
 Covers SPEC ``Client`` items 1-12 plus the parts protocol (both directions, 410
 expiry, a split poll reply). The fake bridge and loaders live in
-``tests/v3/client_fake.py``.
+``tests/bridge/client_fake.py``.
 """
 
 import contextlib
@@ -59,7 +59,7 @@ def test_login_required_when_noninteractive():
         session._access(0.0)
 
 
-def test_protocol_check_rejects_non_v3():
+def test_protocol_check_rejects_wrong_protocol():
     bridge = client_fake.FakeBridge(protocol=2)
     try:
         with pytest.raises(mod.BridgeError) as excinfo:
@@ -426,7 +426,7 @@ def test_remote_error_non_owner_gets_no_traceback():
 
 
 # ---------------------------------------------------------------------------
-# Large payloads: the remoteblt4 parts protocol (SPEC "Large payloads")
+# Large payloads: the parts protocol (SPEC "Large payloads")
 # ---------------------------------------------------------------------------
 def test_parts_download_multipart():
     with connected() as (bridge, blt):

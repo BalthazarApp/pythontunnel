@@ -11,7 +11,7 @@ copying the bundled skills, and maintaining a marked block in ``AGENTS.md`` — 
 describe, space_schema, pandas, mcp, and the project registrations) and exits
 non-zero if anything is wrong, without ever crashing when the bridge is down.
 
-``blt-tunnel connect`` logs in to the Balthazar app tunnel through the v3 reflection
+``blt-tunnel connect`` logs in to the Balthazar app tunnel through the reflection
 bridge (SPEC "blt_analytics integration"), runs ``describe``, and saves the bridge
 profile (``~/.balthazar_bridge.json``); ``blt-tunnel disconnect`` removes it. A
 password is never taken as a command-line argument — only prompted (``getpass``) or
@@ -193,7 +193,7 @@ def _resolve_home(home: str | None) -> str:
     return home or os.environ.get("BLT_ANALYTICS_HOME") or os.path.expanduser("~")
 
 
-# The refresh-token cache lives under ``~/.config``; the v3 bridge profile keeps
+# The refresh-token cache lives under ``~/.config``; the bridge profile keeps
 # only the connection parameters (``~/.balthazar_bridge.json``), never a token. The
 # profile's presence is how connect / disconnect / doctor know a bridge is in play.
 _TOKEN_CACHE = (".config", "balthazar", "remote.json")
@@ -209,7 +209,7 @@ def _bridge_profile_path(home: str) -> str:
 
 
 def _import_balthazar_remote():
-    """The v3 client module (``balthazar_remote``), or ``None`` if it isn't available.
+    """The client module (``balthazar_remote``), or ``None`` if it isn't available.
 
     Honors an already-imported / test-injected ``balthazar_remote`` first, then loads
     it from the bridge dir (``$BLT_BRIDGE_DIR`` or ``<repo>/bridge``). ``blt-tunnel
@@ -232,11 +232,11 @@ def _import_balthazar_remote():
         return None
 
 
-def _bridge_version_safe() -> int | None:
+def _is_bridge_safe() -> bool:
     try:
-        return _blt.bridge_version()
+        return _blt.is_tunnel()
     except Exception:  # noqa: BLE001 - a diagnostic / connect must never crash here
-        return None
+        return False
 
 
 def _has_cached_token(home: str) -> bool:
@@ -481,9 +481,9 @@ def _check_registration(project: str) -> tuple[bool, str]:
 
 
 def run_doctor(*, project: str | None = None, home: str | None = None, out=None) -> int:
-    """Run the v3 diagnostics, print pass/fail, return 0 if all pass else 1.
+    """Run the diagnostics, print pass/fail, return 0 if all pass else 1.
 
-    Reports the located module (v3 bridge or real Runner), the bridge profile/token,
+    Reports the located module (bridge or real Runner), the bridge profile/token,
     ``describe`` and ``space_schema``, plus pandas/mcp/registration. Never triggers an
     interactive login — ``describe`` and ``space_schema`` are skipped (reported FAIL
     with guidance) when a bridge is configured but there is no cached token, since a
@@ -499,7 +499,7 @@ def run_doctor(*, project: str | None = None, home: str | None = None, out=None)
         located = True
     except Exception:  # noqa: BLE001 - a diagnostic must never crash
         located = False
-    is_bridge = _bridge_version_safe() == 3
+    is_bridge = _is_bridge_safe()
     on_runner = located and not is_bridge  # real Runner module
 
     bridge_profile = _bridge_profile_path(home)
@@ -512,15 +512,15 @@ def run_doctor(*, project: str | None = None, home: str | None = None, out=None)
     def c_module() -> tuple[bool, str]:
         if not located:
             return False, "could not locate a balthazar module (run: blt-tunnel connect)"
-        kind = "v3 reflection bridge" if is_bridge else "real Runner module"
+        kind = "reflection bridge" if is_bridge else "real Runner module"
         return True, f"located balthazar ({kind})"
 
     def c_bridge() -> tuple[bool, str]:
         if is_bridge:
-            return True, "v3 reflection bridge (bridge_version=3)"
+            return True, "reflection bridge"
         if on_runner:
             return True, "running on a Runner (no bridge needed)"
-        return False, "no v3 bridge configured (run: blt-tunnel connect)"
+        return False, "no bridge configured (run: blt-tunnel connect)"
 
     def c_connection() -> tuple[bool, str]:
         if on_runner:
@@ -567,7 +567,7 @@ def run_doctor(*, project: str | None = None, home: str | None = None, out=None)
 
 
 # ---------------------------------------------------------------------------
-# blt-tunnel connect / disconnect (v3 reflection bridge over the app tunnel)
+# blt-tunnel connect / disconnect (reflection bridge over the app tunnel)
 # ---------------------------------------------------------------------------
 
 
@@ -596,7 +596,7 @@ def run_connect(
     ca_file: str | None = None,
     out=None,
 ) -> int:
-    """Connect to the Balthazar app tunnel through the v3 bridge and save the profile.
+    """Connect to the Balthazar app tunnel through the bridge and save the profile.
 
     Drives ``balthazar_remote.connect`` + ``save_profile`` and prints who connected
     and the flow run. 0 on success, 1 on any failure (including a missing client).
@@ -614,21 +614,21 @@ def run_connect(
     remote_mod = _import_balthazar_remote()
     if remote_mod is None:
         print(
-            "error: the v3 bridge client (bridge/balthazar_remote.py) is not "
+            "error: the bridge client (bridge/balthazar_remote.py) is not "
             "importable — cannot connect. Check $BLT_BRIDGE_DIR or the bridge/ dir.",
             file=sys.stderr,
         )
         return 1
-    return _run_connect_v3(
+    return _run_connect(
         remote_mod, app_url, login=login, username=username,
         password=password, site=site, ca_file=ca_file, out=out,
     )
 
 
-def _run_connect_v3(
+def _run_connect(
     remote_mod, app_url, *, login, username, password, site, ca_file, out
 ) -> int:
-    """Connect through the v3 bridge, save the profile, and print the describe summary.
+    """Connect through the bridge, save the profile, and print the describe summary.
 
     ``connect`` itself enforces the protocol==3 handshake (it refuses otherwise), so a
     successful return means ``describe`` is good. We then persist the profile and
@@ -659,9 +659,9 @@ def _run_connect_v3(
     caller = desc.get("user", "?")
     shared = desc.get("shared")
     mode = "shared" if shared else "private" if shared is not None else "?"
-    run = _v3_run_ref(remote, desc)
+    run = _run_ref(remote, desc)
     print(
-        f"connected to the v3 bridge as {caller} "
+        f"connected to the bridge as {caller} "
         f"(owner {owner}, {mode} mode)",
         file=out,
     )
@@ -669,7 +669,7 @@ def _run_connect_v3(
     return 0
 
 
-def _v3_run_ref(remote, desc: dict) -> str:
+def _run_ref(remote, desc: dict) -> str:
     """A flow-run identifier for the connect summary (describe first, then Remote)."""
     for key in ("flow_run", "flow_run_id", "run_id", "run"):
         value = desc.get(key)
@@ -686,7 +686,7 @@ def _v3_run_ref(remote, desc: dict) -> str:
 
 
 def run_disconnect(*, forget: bool = False, home: str | None = None, out=None) -> int:
-    """Remove the saved v3 bridge profile (and, with ``forget``, the cached token)."""
+    """Remove the saved bridge profile (and, with ``forget``, the cached token)."""
     out = out or sys.stdout
     home = _resolve_home(home)
     bridge_profile = _bridge_profile_path(home)
@@ -705,7 +705,7 @@ def run_disconnect(*, forget: bool = False, home: str | None = None, out=None) -
         except OSError:
             pass  # no token cached, or already gone
     extra = " and forgot the cached login token" if forget else ""
-    print(f"disconnected the v3 bridge{extra}", file=out)
+    print(f"disconnected the bridge{extra}", file=out)
     return 0
 
 
@@ -756,7 +756,7 @@ def _tunnel_parser() -> argparse.ArgumentParser:
     c.add_argument("--site", default=None, help="Balthazar site URL, if it can't be auto-discovered")
     c.add_argument("--ca-file", dest="ca_file", default=None, help="custom CA bundle (PEM file)")
 
-    x = sub.add_parser("disconnect", help="remove the saved v3 bridge profile")
+    x = sub.add_parser("disconnect", help="remove the saved bridge profile")
     x.add_argument(
         "--forget", action="store_true", help="also delete the cached login/refresh token"
     )
