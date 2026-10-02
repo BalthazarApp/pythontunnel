@@ -1,6 +1,6 @@
 ---
 name: balthazar-tunnel
-description: Run local Python against live Balthazar space data through the v2 session tunnel. Open flow-run contexts with enter_new_flow_run, capture plt.show() figures onto the open run, write run outputs (blt.output) and device params (params.update), and recover stuck contexts with reset_contexts. Covers setup (blt-tunnel doctor, the connection file), importing the shim (import balthazar as blt, from session_tunnel/ or via blt_analytics), what is not tunnelled (blt.secrets, blt.context), and portability to the real Runner. Triggers include: session tunnel, enter_new_flow_run, nested flow runs, plt.show not saving to a run, device.params.update, run stuck in RUNNING, reset_contexts, balthazar.py shim, port 8766, "debug a flow locally against real data".
+description: Run local Python against live Balthazar space data through the v2 session tunnel, either on the Runner host (loopback, automatic) or from a remote laptop through the Balthazar app tunnel (blt-tunnel connect, with Balthazar login). Open flow-run contexts with enter_new_flow_run, capture plt.show() figures onto the open run, write run outputs (blt.output) and device params (params.update), and recover stuck contexts with reset_contexts. Covers connecting (loopback vs app tunnel, blt-tunnel connect/disconnect/doctor, the connection file/profile), importing the shim (import balthazar as blt, from session_tunnel/ or via blt_analytics), what is not tunnelled (blt.secrets, blt.context), and portability to the real Runner. Triggers include: session tunnel, remote tunnel, app tunnel, blt-tunnel connect, connect from a laptop, device-code login, enter_new_flow_run, nested flow runs, plt.show not saving to a run, device.params.update, run stuck in RUNNING, reset_contexts, balthazar.py shim, port 8766, "debug a flow locally against real data".
 ---
 
 # Balthazar session tunnel (v2)
@@ -14,6 +14,60 @@ like a real flow.
 Use this skill when the task is to *act like a flow* locally: open a run, attach plots,
 write outputs, update device params. To *answer data questions* (load devices/runs into
 pandas and plot), use the **balthazar-analytics** skill instead — it builds on this tunnel.
+
+## Two ways to connect
+
+Both expose the **same** `import balthazar as blt`, `blt_analytics` and MCP tools — only
+how you reach the Runner differs.
+
+1. **On the Runner host — loopback (automatic).** Run your local code on the same machine
+   that hosts the tunnel flow. The flow writes `~/.balthazar_session_tunnel.json`
+   (mode 0600) and the shim picks it up with no extra step. This is the default; the
+   **Prerequisites** below describe it.
+
+2. **Remote — through the Balthazar app tunnel.** Run from a laptop that is *not* the
+   Runner host. The platform's app tunnel (`blt.serve_app`) carries the same JSON-RPC over
+   an authenticated HTTPS endpoint, behind your Balthazar login.
+
+   ```bash
+   # a) Start flows/tunnel_session_server.py with the flow parameter:
+   #       app_tunnel = true
+   #    Optionally restrict who may use it (default: the starting user only):
+   #       allowed_users = "alice-id,bob-id"      # or "*" for any logged-in user
+   # b) In Balthazar, click "Open app" on the running flow. The app page shows the
+   #    exact connection snippet and a copy button.
+   # c) Copy the URL from that page (or the address bar) and connect:
+   blt-tunnel connect "https://<host>/app-tunnel/<runner>/<flow>/?space_id=…"
+   # d) Verify, then use blt / blt_analytics / the MCP tools exactly as on loopback:
+   blt-tunnel doctor
+   ```
+
+   - **Login** defaults to a **device code** (`--login device`): the command prints a URL
+     and a code you confirm in a browser — no password typed. Other modes: `--login browser`
+     (PKCE, opens a browser) and `--login password` (prompts, or `--password-stdin`; a
+     password is **never** a command-line argument). `--site`/`--ca-file` cover a site that
+     can't be auto-discovered or a custom CA.
+   - The **refresh token is cached** at `~/.config/balthazar/remote.json` (mode 0600), so
+     later commands reconnect without prompting. The connection profile
+     (`~/.balthazar_session_tunnel.json`, `{"transport": "app", …}`) holds **no** token.
+     `BALTHAZAR_SESSION_TUNNEL_APP_URL` overrides the profile.
+   - `blt-tunnel disconnect` removes the profile; add `--forget` to also drop the cached
+     token.
+   - **Owner-only by default**, and **one app per (runner, flow)** — the tunnel dies when
+     the run ends.
+   - Each app-tunnel request is capped at **60 s**; long operations (first device-cache
+     load, `space_schema`) are handled by **start-then-poll** under the hood, with a
+     one-line progress notice — you don't do anything special.
+   - **MCP note:** a stdio MCP server can't perform an interactive login. If the app
+     transport has no cached token, the schema tools return a clear error asking you to run
+     `blt-tunnel connect` in a terminal first; once connected, they work unchanged.
+
+   Credit: the login client and server-side access guards are ported from the `remoteblt/`
+   developer prototype.
+
+`blt-tunnel doctor` reports the active **transport** (loopback / app / none) and runs the
+right checks for it — and, on the app transport, never triggers a login (it says "run
+blt-tunnel connect" instead when no token is cached).
 
 ## Prerequisites
 
@@ -30,9 +84,10 @@ pandas and plot), use the **balthazar-analytics** skill instead — it builds on
    blt-tunnel doctor
    ```
 
-   It checks the connection file, `ping`, `space_schema`, pandas, the `mcp` package, and
-   the agent registrations, printing pass/fail for each. Fix any failing line first. If
-   `blt-tunnel` is not on PATH, install the package: `uv pip install -e ".[all]"`.
+   It reports the active transport, then checks the connection/profile, `ping`,
+   `space_schema`, pandas, the `mcp` package, and the agent registrations, printing
+   pass/fail for each. Fix any failing line first. If `blt-tunnel` is not on PATH, install
+   the package: `uv pip install -e ".[all]"`.
 
 ## Importing the shim
 

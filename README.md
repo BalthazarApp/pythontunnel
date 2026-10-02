@@ -249,6 +249,43 @@ Both v2 demos start with `DEVICE_TYPE`, `DEVICE_NAME` and `MAX_BATCH_DEVICES`. T
 one matters: the nested example opens one child run per device, so on a space with 65
 devices an uncapped loop would create 65 runs.
 
+## Remote access — the Balthazar app tunnel
+
+Everything above assumes your local code runs on the **same host** as the Runner, reaching
+the loopback server over `127.0.0.1`. You can also drive the v2 tunnel from a **remote
+laptop** through the platform's app tunnel (`blt.serve_app`), behind your Balthazar login.
+The client API, `blt_analytics` and the MCP tools are identical — only the transport
+changes.
+
+```bash
+# 1. Start flows/tunnel_session_server.py with the flow parameter app_tunnel = true.
+#    Optional: allowed_users = "alice-id,bob-id" (default: the starting user only;
+#    "*" lets any logged-in user through).
+# 2. In Balthazar, click "Open app" on the running flow — the page shows the snippet.
+# 3. Copy the URL and connect (device-code login by default):
+blt-tunnel connect "https://<host>/app-tunnel/<runner>/<flow>/?space_id=…"
+# 4. Verify and use blt / blt_analytics / MCP exactly as on loopback:
+blt-tunnel doctor
+```
+
+- **Login** defaults to a device code (`--login device`: confirm a code in a browser, no
+  password). Also `--login browser` (PKCE) and `--login password` (prompted, or
+  `--password-stdin`) — a password is **never** a command-line argument. `--site` /
+  `--ca-file` handle a non-discoverable site or a custom CA.
+- The **refresh token is cached** at `~/.config/balthazar/remote.json` (0600); the saved
+  profile `~/.balthazar_session_tunnel.json` (`{"transport": "app", …}`) holds **no** token.
+  `blt-tunnel disconnect [--forget]` removes the profile (and, with `--forget`, the token).
+  `BALTHAZAR_SESSION_TUNNEL_APP_URL` overrides the profile.
+- **Owner-only by default**; **one app per (runner, flow)**, which dies when the run ends.
+- Each request is capped at **60 s**, so long operations (first device-cache load,
+  `space_schema`) are **polled** transparently by the shim.
+- A stdio **MCP server can't log in interactively**: with no cached token the schema tools
+  return a clear error asking you to `blt-tunnel connect` in a terminal first. `blt-tunnel
+  doctor` reports the transport and, on the app transport, never triggers a login.
+
+The login client and the server-side access guards are ported from the `remoteblt/`
+developer prototype.
+
 ## Security (both)
 
 Binds `127.0.0.1` only, per-session bearer token, non-loopback `Host` headers rejected,
@@ -271,7 +308,9 @@ v2 tunnel above; v1 is untouched.
 ```bash
 uv pip install -e ".[all]"     # package `blt_analytics` + CLI + MCP server
 blt-tunnel setup               # register the MCP server, copy the skills, update AGENTS.md
-blt-tunnel doctor              # check the connection file, ping, schema, pandas, mcp
+# connect from a remote laptop (skip on the Runner host, where loopback is automatic):
+blt-tunnel connect "<app url>" # start the flow with app_tunnel=true, "Open app", copy the URL
+blt-tunnel doctor              # transport, connection, ping, schema, pandas, mcp
 ```
 
 `blt-tunnel setup` is idempotent and prints what it changed: it writes the `balthazar-schema`

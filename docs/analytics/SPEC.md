@@ -484,3 +484,100 @@ this task; server + shim are the Tunnel agent's).
   so the pure-digest tools stay offline and deterministic. Only index names and dotted
   paths surface — never index values. The object index form
   (`{"path": ..., "device_type": ...}`) is flattened to its `path`.
+
+## 7. Remote access through the Balthazar app tunnel (added 2026-10-02)
+
+Goal: use the session tunnel from a laptop that is not the Runner host, through the
+platform's app tunnel (`blt.serve_app`), with Balthazar login. The loopback mode stays
+exactly as it is.
+
+Reference implementation: `remoteblt/` (developer prototype, untracked and gitignored).
+**Port** its login client and server-side guards. **Do not** port its generic reflection
+bridge or object-reference store. Credit it in a module docstring.
+
+### Platform facts (from proto-fe)
+- URL: `{appTunnelOrigin}/app-tunnel/{runner_id}/{flow_id}/…?space_id=…&context_id=…`. The
+  prefix is stripped, so the app sees `/rpc`. The trailing slash matters.
+- **Auth:** only the cookie `blt_tunnel_{runner}_{flow}`. Get it with
+  `POST {site}/api/app-tunnel/grant-access/{runner}/{flow}`, sending
+  `Authorization: Bearer <keycloak access token>` and `X-BLT-Space-Id` (plus
+  `X-BLT-Context-Id`). The cookie expires with the access token. The grant endpoint is
+  rate-limited to 20/min per user.
+- **Headers:** the proxy strips `Authorization`, `Cookie` and `Host` (the app sees
+  `Host: 127.0.0.1:port`). It injects `X-BLT-User-Id` for the authenticated user, after
+  removing any copy the client sent.
+- **Timeout:** 60 s per request. The body-size cap is being removed on the platform side;
+  don't build chunking.
+- **One app per (runner, flow).** The tunnel dies when the run ends.
+- The worker exposes `blt.user`, the starting user's id (see `remoteblt/app/bridge.py`
+  `is_owner`).
+
+### Server (`flows/tunnel_session_server.py`)
+- New flow parameter `app_tunnel: bool = false`. When true:
+  - start a **second** `ThreadingHTTPServer` on `127.0.0.1:0` (ephemeral) and call
+    `blt.serve_app(port)`;
+  - the existing loopback listener keeps its token auth, unchanged.
+- **App listener auth** (no bearer token, because the proxy strips it):
+  - `X-BLT-User-Id` must equal `blt.user`, case-insensitive;
+  - or it must be in the new flow parameter `allowed_users` (comma-separated user ids);
+    `"*"` means any user the platform lets through;
+  - otherwise 403 with a clear message.
+  - **Reject POSTs from browsers:** if `Origin` or `Sec-Fetch-Site` is present, return 403.
+  - **No `Host` check on this listener** (the proxy always gives `127.0.0.1:port`).
+  - This listener trusts `X-BLT-User-Id` because only the proxy reaches it in practice.
+    Document the caveat: on a multi-user Runner host, a local process could forge the
+    header against the ephemeral port.
+- `GET /` on the app listener (owner only) returns a small HTML page with the connection
+  snippet `blt-tunnel connect "<window.location.href>"`, plus a copy button.
+- **Long operations become start-then-poll on both listeners**, because of the 60 s cap:
+  - `refresh_device_cache(wait=False)` and `device_cache_status` already exist;
+  - add `space_schema(wait=False)` returning `{state, progress}`, plus
+    `space_schema_status`; `wait=True` keeps the current behaviour;
+  - `cached_devices` on a cold cache returns `{state: "loading", …}` instead of
+    blocking, **only** when the caller passes `wait=False`. The shim always passes
+    `wait=False` on the app transport and polls.
+- **Byte-budgeted pages for cache-backed ops:** `cached_devices_query` and `cached_devices`
+  take `max_bytes` (default 2_000_000). Results are cut at whole records once the
+  serialized size passes the budget, and the reply returns `next_offset`.
+- `ping` reports `transport: "loopback"|"app"` and the caller user id.
+
+### Shim (`session_tunnel/balthazar.py`) + `blt_analytics/_auth.py` (new)
+- `_auth.py`: a port of `remoteblt/balthazar_remote.py` `_Session`'s auth parts:
+  - the three login modes (`device` default, `browser` PKCE on
+    `http://localhost:8000/callback`, `password`);
+  - the refresh-token cache at `~/.config/balthazar/remote.json` (0600, keyed by
+    `authority|client_id`);
+  - `_access` refresh with margin, `_grant` (retry once on 400/401), and cookie expiry
+    following the access token;
+  - site discovery via `/api/frontend/config` (`oidcAuthority`, `appTunnelOrigin`);
+  - `ca_file` support and no-redirect handling.
+  It must stay **stdlib-only**, since the shim is stdlib-only and imports it by relative
+  file path when `blt_analytics` isn't importable. Simplest: put the auth code in
+  `session_tunnel/_app_auth.py` and have `blt_analytics` reuse it.
+- **Connection profile** (`~/.balthazar_session_tunnel.json`, 0600):
+  - loopback: `{url, token, flow_run_id}` (unchanged);
+  - app: `{transport: "app", app_url, site?, login, client_id, ca_file?}`. Tokens never go
+    in this file; they stay in the token cache.
+  - The environment variable `BALTHAZAR_SESSION_TUNNEL_APP_URL` overrides the file.
+- **App transport:** POST `{tunnel}/rpc` with the cookie and JSON, no `Authorization`.
+  - On 401, grant again once.
+  - On 404: "tunnel flow not running / app tunnel not active".
+  - On 504: "call exceeded the 60 s app-tunnel limit".
+  - Long ops poll the status op every 2 s, printing a one-line progress notice.
+  - Byte-budgeted pages are followed transparently.
+  - Heartbeat keeps working.
+- Remote exceptions keep their mapped built-in type and carry the remote traceback as
+  `exc.remote_traceback`.
+- Before sending, values with `tolist()` (numpy) are converted.
+
+### CLI / docs
+- `blt-tunnel connect "<app url>" [--login device|browser|password] [--username] [--site] [--ca-file]`:
+  1. logs in;
+  2. calls `ping` through the app tunnel;
+  3. writes the app profile;
+  4. prints who is connected and which flow run.
+  `blt-tunnel disconnect` removes the profile and, with `--forget`, the cached refresh
+  token.
+- `blt-tunnel doctor` handles both transports.
+- Update both skills and the README: how to start the tunnel with `app_tunnel=true`, open
+  the app, copy the snippet, then `blt-tunnel connect`.

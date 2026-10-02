@@ -7,9 +7,15 @@ MCP tool returns). ``--refresh`` rebuilds the digest first.
 ``blt-tunnel setup`` wires a project for the analytics workflow — idempotently
 merging the ``balthazar-schema`` MCP server into the per-agent config files,
 copying the bundled skills, and maintaining a marked block in ``AGENTS.md`` — and
-``blt-tunnel doctor`` prints a pass/fail diagnostic (connection file, ping,
-space_schema, pandas, mcp, and the project registrations) and exits non-zero if
-anything is wrong, without ever crashing when the tunnel is down.
+``blt-tunnel doctor`` prints a pass/fail diagnostic (transport, connection/profile,
+ping, space_schema, pandas, mcp, and the project registrations) and exits non-zero
+if anything is wrong, without ever crashing when the tunnel is down.
+
+``blt-tunnel connect`` logs in to a **remote** app tunnel (SPEC §7), pings it, and
+saves the connection profile; ``blt-tunnel disconnect`` removes it. Both drive the
+shim's ``tunnel_connect`` / ``tunnel_disconnect`` / ``tunnel_transport`` functions.
+A password is never taken as a command-line argument — only prompted (``getpass``)
+or read with ``--password-stdin``.
 
 The home directory is overridable (``--home`` / ``$BLT_ANALYTICS_HOME``) so tests
 never touch the real one.
@@ -24,6 +30,7 @@ import shutil
 import sys
 from typing import Any, Callable
 
+from blt_analytics import _blt
 from blt_analytics import schema
 
 # ---------------------------------------------------------------------------
@@ -184,6 +191,56 @@ def _mcp_command() -> str:
 
 def _resolve_home(home: str | None) -> str:
     return home or os.environ.get("BLT_ANALYTICS_HOME") or os.path.expanduser("~")
+
+
+# The loopback connection file and the remote app-tunnel profile share one path
+# (``~/.balthazar_session_tunnel.json``); the ``transport`` key inside tells them
+# apart (SPEC §7). The refresh-token cache lives separately, under ``~/.config``.
+_CONNECTION_FILE = ".balthazar_session_tunnel.json"
+_TOKEN_CACHE = (".config", "balthazar", "remote.json")
+
+
+def _connection_profile_path(home: str) -> str:
+    return os.path.join(home, _CONNECTION_FILE)
+
+
+def _token_cache_path(home: str) -> str:
+    return os.path.join(home, *_TOKEN_CACHE)
+
+
+def _has_cached_token(home: str) -> bool:
+    """Whether the refresh-token cache holds any entry — checked *without* logging in.
+
+    Doctor uses this to decide whether pinging the app tunnel could prompt: a token
+    in the cache means a refresh (not an interactive login) is the expected path, so
+    pinging is safe; an empty/absent cache means ``blt-tunnel connect`` is needed.
+    """
+    try:
+        with open(_token_cache_path(home), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and bool(data)
+
+
+def _detect_transport() -> str:
+    """Best-effort current tunnel transport, never raising.
+
+    Returns the shim's ``tunnel_transport()`` (``"loopback"``/``"app"``/``"none"``);
+    ``"runner"`` when the located module is the real Runner module (no tunnel), and
+    ``"unknown"`` when a shim is present but too old to report it.
+    """
+    try:
+        module = _blt.get_blt()
+    except Exception:  # noqa: BLE001 - no module/shim reachable at all
+        return "none"
+    fn = getattr(module, "tunnel_transport", None)
+    if fn is None:
+        return "unknown" if getattr(module, "__balthazar_tunnel__", False) else "runner"
+    try:
+        return fn() or "none"
+    except Exception:  # noqa: BLE001 - a diagnostic must never crash
+        return "unknown"
 
 
 def _agents_block() -> str:
@@ -378,30 +435,66 @@ def _check_module() -> tuple[bool, str]:
     return True, f"located balthazar ({kind})"
 
 
-def _check_connection(home: str) -> tuple[bool, str]:
-    from blt_analytics import _blt
+_TRANSPORT_LABELS = {
+    "loopback": "loopback (local — same host as the Runner)",
+    "app": "app tunnel (remote — Balthazar login)",
+    "none": "not connected",
+    "runner": "not using the tunnel (real Runner module)",
+    "unknown": "could not determine (shim too old to report it?)",
+}
 
+
+def _check_transport(transport: str) -> tuple[bool, str]:
+    """Report the transport. Informational — the connection check judges 'none'."""
+    return True, _TRANSPORT_LABELS.get(transport, transport)
+
+
+def _check_connection(home: str, transport: str) -> tuple[bool, str]:
+    """Connection/profile presence, by transport.
+
+    The app transport additionally needs a cached login token to work without an
+    interactive prompt; without one it points the user at ``blt-tunnel connect``.
+    """
     try:
         module = _blt.get_blt()
     except Exception:  # noqa: BLE001
         module = None
-    path = getattr(module, "CONNECTION_FILE", None) or os.path.join(
-        home, ".balthazar_session_tunnel.json"
-    )
+    path = getattr(module, "CONNECTION_FILE", None) or _connection_profile_path(home)
+
+    if transport == "runner":
+        return True, "running on a Runner; no connection file needed"
+
+    if transport == "app":
+        have_profile = os.path.exists(path) or bool(
+            os.environ.get("BALTHAZAR_SESSION_TUNNEL_APP_URL")
+        )
+        if not have_profile:
+            return False, f"no app-tunnel profile at {path} (run: blt-tunnel connect)"
+        if _has_cached_token(home):
+            return True, f"app-tunnel profile present ({path}); cached login token found"
+        return False, "app-tunnel profile present but no cached login token (run: blt-tunnel connect)"
+
     if os.path.exists(path):
         return True, f"connection file present ({path})"
     return False, f"no connection file at {path}"
 
 
-def _check_ping() -> tuple[bool, str]:
-    from blt_analytics import _blt
+def _check_ping(transport: str, home: str) -> tuple[bool, str]:
+    # Never trigger an interactive login from a diagnostic: on the app transport with
+    # no cached token, pinging would prompt (device code / browser), so skip it.
+    if transport == "app" and not _has_cached_token(home):
+        return False, "skipped: no cached login token — run blt-tunnel connect in a terminal"
 
     module = _blt.get_blt()
     ping = getattr(module, "ping", None)
     if ping is None:
         return False, "module has no ping()"
-    ping()
-    return True, "ping ok"
+    info = ping() or {}
+    who = info.get("user") or info.get("user_id") if isinstance(info, dict) else None
+    detail = "ping ok"
+    if who:
+        detail += f" (user {who})"
+    return True, detail
 
 
 def _check_space_schema() -> tuple[bool, str]:
@@ -451,11 +544,13 @@ def run_doctor(*, project: str | None = None, home: str | None = None, out=None)
     out = out or sys.stdout
     project = os.path.abspath(project or os.getcwd())
     home = _resolve_home(home)
+    transport = _detect_transport()
 
     checks = [
         _check("balthazar module", _check_module),
-        _check("connection file", lambda: _check_connection(home)),
-        _check("ping", _check_ping),
+        _check("transport", lambda: _check_transport(transport)),
+        _check("connection", lambda: _check_connection(home, transport)),
+        _check("ping", lambda: _check_ping(transport, home)),
         _check("space_schema", _check_space_schema),
         _check("pandas", lambda: _check_import("pandas")),
         _check("mcp", _check_mcp),
@@ -468,6 +563,115 @@ def run_doctor(*, project: str | None = None, home: str | None = None, out=None)
     all_ok = all(ok for _name, ok, _detail in checks)
     print(("all checks passed" if all_ok else "some checks failed"), file=out)
     return 0 if all_ok else 1
+
+
+# ---------------------------------------------------------------------------
+# blt-tunnel connect / disconnect (remote app tunnel, SPEC §7)
+# ---------------------------------------------------------------------------
+
+
+def _read_password(login: str, *, password_stdin: bool, out=None) -> str | None:
+    """Obtain the password for ``password`` login — never from the command line.
+
+    Read from stdin with ``--password-stdin`` (one line, trailing newline stripped),
+    otherwise prompt with :func:`getpass.getpass`. ``None`` for the other logins.
+    """
+    if login != "password":
+        return None
+    if password_stdin:
+        return sys.stdin.readline().rstrip("\n")
+    import getpass
+
+    return getpass.getpass("Balthazar password: ")
+
+
+def run_connect(
+    app_url: str,
+    *,
+    login: str = "device",
+    username: str | None = None,
+    password_stdin: bool = False,
+    site: str | None = None,
+    ca_file: str | None = None,
+    out=None,
+) -> int:
+    """Log in to a remote app tunnel and save the profile. Returns an exit code.
+
+    Drives the shim's ``tunnel_connect`` (login + ping + profile write) and prints
+    who connected and which flow run. 0 on success, 1 on any failure.
+    """
+    out = out or sys.stdout
+
+    if login == "password" and not username:
+        username = input("Balthazar username: ").strip()
+    try:
+        password = _read_password(login, password_stdin=password_stdin)
+    except (EOFError, KeyboardInterrupt):
+        print("error: no password supplied", file=sys.stderr)
+        return 1
+
+    try:
+        module = _blt.get_blt()
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: could not load the balthazar shim: {exc}", file=sys.stderr)
+        return 1
+
+    connect = getattr(module, "tunnel_connect", None)
+    if connect is None:
+        print(
+            "error: this balthazar shim has no tunnel_connect(...) — the app tunnel "
+            "needs the v2 session shim (session_tunnel/balthazar.py).",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        info = connect(
+            app_url,
+            login=login,
+            username=username,
+            password=password,
+            site=site,
+            ca_file=ca_file,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface any login/connection failure cleanly
+        print(f"error: could not connect: {exc}", file=sys.stderr)
+        return 1
+
+    info = info if isinstance(info, dict) else {}
+    who = info.get("user") or info.get("user_id") or "?"
+    transport = info.get("transport") or "app"
+    run_id = info.get("flow_run_id") or "?"
+    flow_name = info.get("flow_name")
+    print(f"connected over the {transport} tunnel as user {who}", file=out)
+    tail = f" (flow {flow_name!r})" if flow_name else ""
+    print(f"flow run: {run_id}{tail}", file=out)
+    return 0
+
+
+def run_disconnect(*, forget: bool = False, out=None) -> int:
+    """Remove the saved tunnel profile (and, with ``forget``, the cached token)."""
+    out = out or sys.stdout
+    try:
+        module = _blt.get_blt()
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: could not load the balthazar shim: {exc}", file=sys.stderr)
+        return 1
+
+    disconnect = getattr(module, "tunnel_disconnect", None)
+    if disconnect is None:
+        print("error: this balthazar shim has no tunnel_disconnect(...)", file=sys.stderr)
+        return 1
+
+    try:
+        disconnect(forget=forget)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: could not disconnect: {exc}", file=sys.stderr)
+        return 1
+
+    extra = " and forgot the cached login token" if forget else ""
+    print(f"disconnected{extra}", file=out)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +699,32 @@ def _tunnel_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("doctor", help="print a pass/fail connection diagnostic")
     d.add_argument("--project", default=".", help="project directory (default: cwd)")
     d.add_argument("--home", default=None, help=argparse.SUPPRESS)
+
+    c = sub.add_parser(
+        "connect", help="connect to a remote tunnel through the Balthazar app tunnel"
+    )
+    c.add_argument("app_url", help="the app-tunnel URL (copy it from the opened app in Balthazar)")
+    c.add_argument(
+        "--login",
+        choices=("device", "browser", "password"),
+        default="device",
+        help="login method (default: device — a device code you confirm in a browser)",
+    )
+    c.add_argument("--username", default=None, help="username (password login; prompted if omitted)")
+    c.add_argument(
+        "--password-stdin",
+        dest="password_stdin",
+        action="store_true",
+        help="read the password from stdin (password login). A password is never taken "
+        "as a command-line argument; without this flag it is prompted via getpass.",
+    )
+    c.add_argument("--site", default=None, help="Balthazar site URL, if it can't be auto-discovered")
+    c.add_argument("--ca-file", dest="ca_file", default=None, help="custom CA bundle (PEM file)")
+
+    x = sub.add_parser("disconnect", help="remove the saved app-tunnel profile")
+    x.add_argument(
+        "--forget", action="store_true", help="also delete the cached login/refresh token"
+    )
 
     return parser
 
@@ -526,6 +756,19 @@ def tunnel_main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return run_doctor(project=args.project, home=args.home)
+
+    if args.command == "connect":
+        return run_connect(
+            args.app_url,
+            login=args.login,
+            username=args.username,
+            password_stdin=args.password_stdin,
+            site=args.site,
+            ca_file=args.ca_file,
+        )
+
+    if args.command == "disconnect":
+        return run_disconnect(forget=args.forget)
 
     _tunnel_parser().error("a subcommand is required")  # pragma: no cover
     return 2

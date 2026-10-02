@@ -75,6 +75,27 @@ reload 250k devices. The cache is read by ``cached_devices`` / ``cached_devices_
 ``update_device_params``, and reloadable with ``refresh_device_cache``. These are
 read ops too (``_last_seen_touch``, never ``_claim``); the ones that may trigger a
 load are orchestrated on the worker thread rather than run as a capped executor job.
+
+REMOTE ACCESS THROUGH THE APP TUNNEL (spec §7). With the ``app_tunnel`` flow
+parameter set, the server starts a *second* listener on an ephemeral ``127.0.0.1``
+port and exposes it through ``blt.serve_app(port)``, so a laptop that is not the
+Runner host can reach the tunnel through the platform's app tunnel (with Balthazar
+login). The loopback listener keeps its per-session bearer token, unchanged. The two
+listeners share one request pipeline (``_BaseHandler``) and differ only in their auth
+policy: the app listener trusts the proxy-injected ``X-BLT-User-Id`` header (which
+must match ``blt.user`` case-insensitively, or appear in the ``allowed_users`` flow
+parameter, or be allowed by ``"*"``), rejects browser-originated POSTs, and does no
+``Host`` check (the proxy always presents ``127.0.0.1:port``). Caveat: because the
+app listener trusts ``X-BLT-User-Id``, a local process on a multi-user Runner host
+could forge it against the ephemeral port; only the proxy reaches it in practice.
+Because the app tunnel caps every request at 60 s, the long operations are
+start-then-poll: ``space_schema(wait=False)`` + ``space_schema_status``,
+``cached_devices(wait=False)`` returning a loading state on a cold cache, and
+``refresh_device_cache(wait=False)``; the cache-backed reads page under a byte budget
+(``max_bytes``) and return a ``next_offset``. ``GET /`` on the app listener serves the
+owner a one-line connection snippet. The owner check, browser check, ephemeral-port
+startup and connection page are ported from the developer prototype
+``remoteblt/app/bridge.py`` (untracked); its generic reflection bridge is not ported.
 """
 
 import base64
@@ -135,6 +156,28 @@ _stats = {
 # rather than building it twice.
 _schema_cache = {"digest": None}
 _schema_lock = threading.Lock()
+
+# Live progress for the start-then-poll ``space_schema(wait=False)`` path (spec §7).
+# Mutated in place during a build so ``space_schema_status`` can report without taking
+# ``_schema_lock``; field reads/writes are GIL-atomic, which is all a snapshot needs.
+# ``_schema_cache["digest"]`` being non-None is the authoritative "ready" signal.
+_schema_build = {
+    "state": "empty",     # "empty" | "building" | "ready" | "error"
+    "started_at": None,
+    "loaded_flows": 0,
+    "total_flows": None,
+    "error": None,
+}
+
+# App-tunnel auth (spec §7), parsed from the flow params at start. ``_allow_all_users``
+# is the ``"*"`` wildcard; ``_allowed_users`` holds the explicit ids, lowercased for the
+# case-insensitive match. Empty + no wildcard means only the owner (``blt.user``).
+_allowed_users: set = set()
+_allow_all_users = False
+
+# Byte budget for the cache-backed paged ops (spec §7). Results are cut at whole
+# records once the serialized size passes this, and the reply carries ``next_offset``.
+_DEFAULT_CACHE_PAGE_MAX_BYTES = 2_000_000
 
 # Page size for ``space_schema``'s per-flow run paging. A module global (not a
 # default arg) so it reads live — handy for tests, and a single knob here.
@@ -503,6 +546,10 @@ def _op_ping(kwargs):
         "idle_timeout_s": _idle_timeout,
         # name -> path, so the shim can advertise dynamic get_<index>_devices().
         "device_indexes": {n: s["path"] for n, s in _device_indexes.items()},
+        # Which listener served this call, and the authenticated caller (app tunnel
+        # only; None on loopback). Injected into kwargs by the HTTP handler (spec §7).
+        "transport": kwargs.get("_transport", "loopback"),
+        "user": kwargs.get("_caller_user_id"),
     }
 
 
@@ -757,72 +804,144 @@ def _page_flow_runs(flow_id, max_runs, deadline=None):
     return records, hit_cap
 
 
-def _op_space_schema(kwargs):
+def _build_space_schema(refresh, max_runs_per_flow):
     """Build (or return the cached) measurement-free digest of the whole space.
 
-    Orchestrated on the calling (HTTP worker) thread: the expensive ``blt.*`` reads
-    are handed to the main-thread executor as many small jobs — one device page, the
-    flows, one run page at a time — so the executor keeps returning to ``_JOBS.get``
-    and other clients' ops interleave rather than 504-ing behind the whole build. The
-    digest itself is pure and is built here, off the main thread. ``_schema_lock``
-    serializes concurrent builds: a second caller waits, then returns the same cache.
+    Orchestrated on the calling thread: the expensive ``blt.*`` reads are handed to
+    the main-thread executor as many small jobs — one device page, the flows, one run
+    page at a time — so the executor keeps returning to ``_JOBS.get`` and other
+    clients' ops interleave rather than 504-ing behind the whole build. The digest
+    itself is pure and is built here, off the main thread. ``_schema_lock`` serializes
+    concurrent builds: a second caller waits, then returns the same cache.
 
     The build has its own generous budget (``_SCHEMA_BUILD_BUDGET_S``), separate from
-    the per-job ``_JOB_TIMEOUT_S``; the HTTP request waits for the whole build (it is
-    not run as a single capped ``_JOBS`` job — see :meth:`_Handler.do_POST`).
+    the per-job ``_JOB_TIMEOUT_S``. Progress is recorded in ``_schema_build`` so the
+    poll op can report it. Raises ``RuntimeError`` when the ``blt_analytics`` package is
+    not importable on this Runner (the client then builds the digest locally).
     """
-    _last_seen_touch(kwargs)
-    _stats["reads_served"] += 1
-    refresh = bool(kwargs.get("refresh", False))
-    max_runs_per_flow = int(kwargs.get("max_runs_per_flow", 2000))
-
     with _schema_lock:
         if not refresh and _schema_cache.get("digest") is not None:
+            _schema_build["state"] = "ready"
             return _schema_cache["digest"]
 
+        _schema_build.update(
+            state="building", started_at=_iso_now(), loaded_flows=0,
+            total_flows=None, error=None,
+        )
         try:
             digest_mod = _import_digest()
         except Exception as exc:  # noqa: BLE001 - old Runner without the package
+            _schema_build.update(state="error", error=f"{type(exc).__name__}: {exc}")
             raise RuntimeError(
                 f"space_schema unavailable on this Runner: {exc}"
             ) from exc
 
-        deadline = time.monotonic() + _SCHEMA_BUILD_BUDGET_S
+        try:
+            deadline = time.monotonic() + _SCHEMA_BUILD_BUDGET_S
 
-        # Build from the device cache when it is ready, instead of re-paging every
-        # device (spec §6). The store is swapped atomically, so one reference read
-        # gives a consistent snapshot.
-        if _cache_meta["state"] == "ready":
-            device_records = list(_device_store["records"].values())
-        else:
-            device_records = _fetch_devices_paged(deadline)
-        flow_records = _fetch_flows(deadline)
+            # Build from the device cache when it is ready, instead of re-paging every
+            # device (spec §6). The store is swapped atomically, so one reference read
+            # gives a consistent snapshot.
+            if _cache_meta["state"] == "ready":
+                device_records = list(_device_store["records"].values())
+            else:
+                device_records = _fetch_devices_paged(deadline)
+            flow_records = _fetch_flows(deadline)
+            _schema_build["total_flows"] = len(flow_records)
 
-        run_records = []
-        truncated_flow_ids = set()
-        for flow in flow_records:
-            records, hit_cap = _page_flow_runs(flow["id"], max_runs_per_flow, deadline)
-            run_records.extend(records)
-            if hit_cap:
-                truncated_flow_ids.add(flow["id"])
+            run_records = []
+            truncated_flow_ids = set()
+            for flow in flow_records:
+                records, hit_cap = _page_flow_runs(flow["id"], max_runs_per_flow, deadline)
+                run_records.extend(records)
+                if hit_cap:
+                    truncated_flow_ids.add(flow["id"])
+                _schema_build["loaded_flows"] += 1
 
-        digest = digest_mod.build_digest(device_records, flow_records, run_records)
+            digest = digest_mod.build_digest(device_records, flow_records, run_records)
 
-        # The digest builder has no notion of capping; stamp the truncation flags it
-        # left at their defaults once we know which flows we stopped short on. Resolve
-        # each flow id to its digest key via the digest's own public keying rule, so
-        # the stamp lands on the right entry even when flow names clash.
-        if truncated_flow_ids:
-            digest["totals"]["runs_truncated"] = True
-        key_by_id = digest_mod.flow_key(flow_records)
-        for flow_id in truncated_flow_ids:
-            entry = digest["flows"].get(key_by_id.get(flow_id))
-            if entry is not None:
-                entry["truncated"] = True
-                entry["runs_sampled"] = entry.get("run_count", 0)
+            # The digest builder has no notion of capping; stamp the truncation flags
+            # it left at their defaults once we know which flows we stopped short on.
+            # Resolve each flow id to its digest key via the digest's own public keying
+            # rule, so the stamp lands on the right entry even when flow names clash.
+            if truncated_flow_ids:
+                digest["totals"]["runs_truncated"] = True
+            key_by_id = digest_mod.flow_key(flow_records)
+            for flow_id in truncated_flow_ids:
+                entry = digest["flows"].get(key_by_id.get(flow_id))
+                if entry is not None:
+                    entry["truncated"] = True
+                    entry["runs_sampled"] = entry.get("run_count", 0)
+        except Exception as exc:  # noqa: BLE001 - record then re-raise for the poller
+            _schema_build.update(state="error", error=f"{type(exc).__name__}: {exc}")
+            raise
 
         _schema_cache["digest"] = digest
+        _schema_build.update(state="ready", error=None)
         return digest
+
+
+def _space_schema_status_dict():
+    """A ``{state, progress, error}`` snapshot for the poll flow, with ``digest`` when
+    ready. While a build is in flight the state is ``building`` even if a stale digest
+    is still cached (so a refresh poll does not hand back the old one)."""
+    state = _schema_build["state"]
+    if state != "building" and _schema_cache.get("digest") is not None:
+        state = "ready"
+    out = {
+        "state": state,
+        "progress": {
+            "loaded_flows": _schema_build["loaded_flows"],
+            "total_flows": _schema_build["total_flows"],
+            "started_at": _schema_build["started_at"],
+        },
+        "error": _schema_build["error"],
+    }
+    if state == "ready":
+        out["digest"] = _schema_cache["digest"]
+    return out
+
+
+def _start_schema_build_async(refresh, max_runs_per_flow):
+    """Kick off a background build if one is not already running (spec §7 poll flow)."""
+    if _schema_build["state"] == "building":
+        return
+    _schema_build["state"] = "building"
+
+    def _bg():
+        try:
+            _build_space_schema(refresh, max_runs_per_flow)
+        except Exception:  # noqa: BLE001 - recorded in _schema_build for the poller
+            pass
+
+    threading.Thread(target=_bg, name="space-schema-build", daemon=True).start()
+
+
+def _op_space_schema(kwargs):
+    """Build the space digest. ``wait=True`` (default) blocks and returns the digest,
+    exactly as before. ``wait=False`` starts a background build (unless one is cached)
+    and returns a ``{state, progress}`` snapshot at once, for the 60 s-capped app
+    transport to poll with ``space_schema_status`` (spec §7)."""
+    _last_seen_touch(kwargs)
+    _stats["reads_served"] += 1
+    refresh = bool(kwargs.get("refresh", False))
+    max_runs_per_flow = int(kwargs.get("max_runs_per_flow", 2000))
+    wait = kwargs.get("wait", True)
+
+    if wait is not False:
+        return _build_space_schema(refresh, max_runs_per_flow)
+
+    if not refresh and _schema_cache.get("digest") is not None:
+        return _space_schema_status_dict()
+    _start_schema_build_async(refresh, max_runs_per_flow)
+    return _space_schema_status_dict()
+
+
+def _op_space_schema_status(kwargs):
+    """Report the progress of a ``space_schema(wait=False)`` build; includes the digest
+    once ``state == "ready"`` (spec §7). Never starts a build; never loads."""
+    _last_seen_touch(kwargs)
+    return _space_schema_status_dict()
 
 
 # ----------------------------------------------------------------------------
@@ -1247,33 +1366,99 @@ def _require_index(index_name):
         )
 
 
+def _budget_page(records, max_bytes):
+    """Return the longest whole-record prefix of ``records`` whose serialized size
+    stays within ``max_bytes`` (spec §7). At least one record is always returned when
+    ``records`` is non-empty, so a single record larger than the budget still comes
+    back alone rather than wedging the pull."""
+    page = []
+    size = 0
+    for record in records:
+        record_size = len(json.dumps(record, default=str).encode("utf-8"))
+        if page and size + record_size > max_bytes:
+            break
+        page.append(record)
+        size += record_size
+    return page
+
+
+def _start_device_cache_load_async():
+    """Kick off a full device-cache load in the background if one is not already
+    running — the non-blocking counterpart used by ``cached_devices(wait=False)``."""
+    if _cache_meta["state"] == "loading":
+        return
+
+    def _bg():
+        try:
+            _reload_device_cache(force=False)
+        except Exception:  # noqa: BLE001 - the failure is recorded in the status
+            pass
+
+    threading.Thread(target=_bg, name="device-cache-load", daemon=True).start()
+
+
 def _op_cached_devices(kwargs):
     """Return the cached device records for one index value. Loads first if cold.
 
     ``refresh=True`` re-fetches that value's known ids (spec §6) before serving.
+
+    Reply shape (spec §7): with no new kwarg the reply is the bare ``[record]`` list,
+    byte-for-byte as before. When the caller opts into the app-transport protocol —
+    passing ``wait``, ``max_bytes`` or ``offset`` — the reply is a dict
+    ``{state, devices, next_offset, total, offset}``. With ``wait=False`` on a cold
+    cache it returns ``{state: "loading", devices: [], ...}`` at once instead of
+    blocking, kicking off the load in the background for the caller to poll.
     """
     _last_seen_touch(kwargs)
     _stats["reads_served"] += 1
     index_name = kwargs.get("index")
     value = kwargs.get("value")
     _require_index(index_name)
+
+    wait = kwargs.get("wait", True)
+    paged = ("max_bytes" in kwargs) or ("offset" in kwargs) or ("wait" in kwargs)
+
     if _cache_meta["state"] != "ready":
+        if wait is False:
+            _start_device_cache_load_async()
+            return {
+                "state": "loading", "devices": [], "next_offset": None,
+                "total": 0, "offset": 0,
+                "loaded": _cache_meta["loaded"], "count": _cache_meta["count"],
+            }
         _reload_device_cache(force=False)
+
     if kwargs.get("refresh", False):
         _refresh_index_value(index_name, value)
+
     store = _device_store
     ids = store["index"].get(index_name, {}).get(str(value), [])
-    records = store["records"]
-    return [records[i] for i in ids if i in records]
+    records_by_id = store["records"]
+    records = [records_by_id[i] for i in ids if i in records_by_id]
+
+    if not paged:
+        return records
+
+    offset = int(kwargs.get("offset") or 0)
+    max_bytes = int(kwargs.get("max_bytes") or _DEFAULT_CACHE_PAGE_MAX_BYTES)
+    page = _budget_page(records[offset:], max_bytes)
+    next_start = offset + len(page)
+    next_offset = next_start if next_start < len(records) else None
+    return {
+        "state": "ready", "devices": page, "next_offset": next_offset,
+        "total": len(records), "offset": offset,
+    }
 
 
 def _op_cached_devices_query(kwargs):
     """Return cached device records, optionally type-filtered and key-projected, paged.
 
     Loads first if cold. ``device_type`` keeps one type (or a list of types); ``keys``
-    projects to those top-level param keys. ``offset``/``limit`` page the result — a
-    whole-space pull would otherwise make a response far larger than the request cap,
-    so the shim pages transparently. Returns ``{devices, total, offset, limit}``.
+    projects to those top-level param keys. ``offset``/``limit`` page the result, and
+    ``max_bytes`` (default 2 MB, spec §7) further cuts the page at a whole-record
+    boundary so one response never dwarfs the request cap. Returns
+    ``{devices, total, offset, limit, next_offset}``; the shim follows ``next_offset``
+    until it is ``None`` to assemble the whole frame.
     """
     _last_seen_touch(kwargs)
     _stats["reads_served"] += 1
@@ -1284,6 +1469,7 @@ def _op_cached_devices_query(kwargs):
     keys = kwargs.get("keys")
     offset = int(kwargs.get("offset") or 0)
     limit = int(kwargs.get("limit") or 0)
+    max_bytes = int(kwargs.get("max_bytes") or _DEFAULT_CACHE_PAGE_MAX_BYTES)
 
     store = _device_store
     records = sorted(store["records"].values(), key=lambda r: r["id"])
@@ -1291,16 +1477,20 @@ def _op_cached_devices_query(kwargs):
         wanted = set(device_type if isinstance(device_type, (list, tuple, set)) else [device_type])
         records = [r for r in records if r.get("type") in wanted]
     total = len(records)
-    if offset:
-        records = records[offset:]
-    if limit:
-        records = records[:limit]
 
-    if keys is None:
-        out = records
-    else:
-        out = [{**r, "params": _project_params(r.get("params") or {}, keys)} for r in records]
-    return {"devices": out, "total": total, "offset": offset, "limit": limit}
+    window = records[offset:]
+    if limit:
+        window = window[:limit]
+    if keys is not None:
+        window = [{**r, "params": _project_params(r.get("params") or {}, keys)} for r in window]
+
+    page = _budget_page(window, max_bytes)
+    next_start = offset + len(page)
+    next_offset = next_start if next_start < total else None
+    return {
+        "devices": page, "total": total, "offset": offset, "limit": limit,
+        "next_offset": next_offset,
+    }
 
 
 def _warm_device_cache_async():
@@ -1504,6 +1694,8 @@ _DISPATCH = {
     "log": _op_log,
     # Device cache: status never loads, so it is a fast executor job.
     "device_cache_status": _op_device_cache_status,
+    # space_schema poll status (spec §7): a fast snapshot, never builds or loads.
+    "space_schema_status": _op_space_schema_status,
 }
 
 # Ops orchestrated on the HTTP worker thread rather than run as a single main-thread
@@ -1529,9 +1721,46 @@ _ALL_OPS = set(_DISPATCH) | set(_WORKER_DISPATCH)
 # HTTP layer — worker threads; never calls blt.* directly
 # ----------------------------------------------------------------------------
 
+# The app-listener connection page (spec §7, ported from remoteblt/app/bridge.py's
+# INDEX_PAGE). The snippet is assembled client-side from ``window.location.href`` so
+# nothing user-provided is ever interpolated into the HTML on the server.
+_INDEX_PAGE = b"""<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Balthazar session tunnel</title>
+<body style="font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 48px auto; padding: 0 16px; color: #18181b; background: #ffffff">
+<h1 style="font-size: 1.4rem; margin-bottom: 0.25rem">Session tunnel is running</h1>
+<p style="color: #52525b">Connect the Balthazar analytics tools to this flow run from your computer:</p>
+<pre id="snippet" style="background: #f4f4f5; padding: 16px; border-radius: 8px; overflow-x: auto; font-size: 0.95rem"></pre>
+<button id="copy" style="padding: 8px 16px; border: 1px solid #d4d4d8; border-radius: 6px; background: #fafafa; cursor: pointer; font-size: 0.9rem">Copy</button>
+<span id="copied" style="margin-left: 8px; color: #16a34a; display: none">Copied</span>
+<script>
+var cmd = 'blt-tunnel connect "' + window.location.href + '"';
+document.getElementById("snippet").textContent = cmd;
+document.getElementById("copy").addEventListener("click", function () {
+  navigator.clipboard.writeText(cmd).then(function () {
+    var c = document.getElementById("copied");
+    c.style.display = "inline";
+    setTimeout(function () { c.style.display = "none"; }, 1500);
+  });
+});
+</script>
+</body>
+</html>
+"""
 
-class _Handler(BaseHTTPRequestHandler):
+
+class _BaseHandler(BaseHTTPRequestHandler):
+    """Shared request pipeline for both listeners (spec §7).
+
+    Both listeners run the *same* ``_rpc`` dispatch over the *same* ``_DISPATCH`` /
+    ``_WORKER_DISPATCH`` tables; they differ only in :meth:`_deny_post` (the auth
+    policy) and ``transport``. Subclasses must not duplicate the pipeline.
+    """
+
     protocol_version = "HTTP/1.1"
+    transport = "loopback"
 
     def log_message(self, fmt, *args):  # noqa: A003 - BaseHTTPRequestHandler hook
         pass
@@ -1544,32 +1773,60 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _reply_bytes(self, code, body, content_type):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _error(self, code, kind, message):
         self._reply(code, {"ok": False, "error": {"type": kind, "message": message}})
 
-    def _authorized(self):
-        if (self.headers.get("Host") or "").split(":")[0] not in ("127.0.0.1", "localhost", ""):
-            return False
-        header = self.headers.get("Authorization") or ""
-        prefix = "Bearer "
-        if not header.startswith(prefix):
-            return False
-        return hmac.compare_digest(header[len(prefix) :], _TOKEN)
+    def _read_chunked(self):
+        """Read a chunked request body (ported from remoteblt/app/bridge.py).
+
+        The platform proxy may forward a chunked body with no Content-Length; a plain
+        ``rfile.read(Content-Length)`` would then read zero bytes. Loopback clients
+        never send chunked, so they still take the Content-Length path in do_POST and
+        behave byte-for-byte as before.
+        """
+        chunks = []
+        while True:
+            size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+            if size == 0:
+                while self.rfile.readline().strip():
+                    pass
+                return b"".join(chunks)
+            chunks.append(self.rfile.read(size))
+            self.rfile.readline()
+
+    def _deny_post(self):
+        """Return ``(code, kind, message)`` to reject the POST, or ``None`` to allow it.
+        Sets ``self._caller_user_id`` for the dispatch. Subclasses override."""
+        raise NotImplementedError
 
     def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler hook
         if self.path.rstrip("/") != "/rpc":
             self._error(404, "ValueError", "not found")
             return
-        if not self._authorized():
-            self._error(401, "PermissionError", "unauthorized")
+        self._caller_user_id = None
+        denial = self._deny_post()
+        if denial is not None:
+            self._error(*denial)
             return
 
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > _MAX_BODY_BYTES:
-            self._error(413, "ValueError", "body too large")
-            return
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            raw = self._read_chunked()
+        else:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > _MAX_BODY_BYTES:
+                self._error(413, "ValueError", "body too large")
+                return
+            raw = self.rfile.read(length)
+
         try:
-            request = json.loads(self.rfile.read(length).decode("utf-8"))
+            request = json.loads(raw.decode("utf-8"))
             op = request["op"]
         except (ValueError, KeyError, UnicodeDecodeError) as exc:
             self._error(400, "ValueError", f"bad request: {exc}")
@@ -1579,7 +1836,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         kwargs = request.get("kwargs") or {}
+        # Thread the transport and authenticated caller into the op (read by _op_ping),
+        # under reserved underscore keys so they can never collide with a real kwarg.
+        kwargs["_transport"] = self.transport
+        kwargs["_caller_user_id"] = self._caller_user_id
+        self._run_op(op, kwargs)
 
+    def _run_op(self, op, kwargs):
         if op in _WORKER_DISPATCH:
             # Orchestrated on this worker thread: it submits its own small jobs to
             # the executor, so other clients interleave, and it is not bounded by the
@@ -1607,9 +1870,129 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply(200, {"ok": True, "result": payload} if ok else {"ok": False, "error": payload})
 
 
+class _LoopbackHandler(_BaseHandler):
+    """The original loopback listener: non-loopback Host rejected, per-session bearer
+    token required. Behaviour is byte-for-byte what it was before the refactor."""
+
+    transport = "loopback"
+
+    def _authorized(self):
+        if (self.headers.get("Host") or "").split(":")[0] not in ("127.0.0.1", "localhost", ""):
+            return False
+        header = self.headers.get("Authorization") or ""
+        prefix = "Bearer "
+        if not header.startswith(prefix):
+            return False
+        return hmac.compare_digest(header[len(prefix) :], _TOKEN)
+
+    def _deny_post(self):
+        self._caller_user_id = None
+        if not self._authorized():
+            return (401, "PermissionError", "unauthorized")
+        return None
+
+
+class _AppHandler(_BaseHandler):
+    """The app-tunnel listener (spec §7). No bearer and no Host check — the platform
+    proxy strips both and injects ``X-BLT-User-Id`` for the authenticated user. A POST
+    is allowed when that header matches ``blt.user`` (case-insensitive), is in
+    ``allowed_users``, or ``"*"`` is configured; browser-originated POSTs are refused.
+    ``GET /`` serves the owner the connection snippet."""
+
+    transport = "app"
+
+    def _is_owner(self):
+        owner = str(getattr(blt, "user", None) or "")
+        caller = self.headers.get("X-BLT-User-Id") or ""
+        return bool(owner) and caller.lower() == owner.lower()
+
+    def _from_browser(self):
+        return bool(self.headers.get("Origin") or self.headers.get("Sec-Fetch-Site"))
+
+    def _app_authorized(self):
+        caller = (self.headers.get("X-BLT-User-Id") or "").strip()
+        if not caller:
+            return False
+        if self._is_owner():
+            return True
+        if _allow_all_users:
+            return True
+        return caller.lower() in _allowed_users
+
+    def _deny_post(self):
+        self._caller_user_id = self.headers.get("X-BLT-User-Id")
+        # A browser must never drive the tunnel, even as the owner (CSRF): a page on
+        # another origin could otherwise POST with the proxy-supplied credentials.
+        if self._from_browser():
+            return (403, "PermissionError",
+                    "the app tunnel does not accept RPC calls from a browser")
+        if not self._app_authorized():
+            return (403, "PermissionError",
+                    "not authorized: X-BLT-User-Id must match the flow owner or be "
+                    "listed in the tunnel's allowed_users")
+        return None
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler hook
+        if self.path.split("?")[0] != "/":
+            self._error(404, "ValueError", "not found")
+            return
+        if not self._is_owner():
+            self._reply_bytes(
+                403, b"This session tunnel belongs to another user",
+                "text/plain; charset=utf-8",
+            )
+            return
+        self._reply_bytes(200, _INDEX_PAGE, "text/html; charset=utf-8")
+
+
 # ----------------------------------------------------------------------------
 # Lifecycle
 # ----------------------------------------------------------------------------
+
+
+def _parse_allowed_users(raw):
+    """Parse the ``allowed_users`` flow param (comma-separated ids). Returns
+    ``(ids, allow_all)``: ids are lowercased for the case-insensitive match, and
+    ``allow_all`` is set when ``"*"`` appears (spec §7)."""
+    parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+    allow_all = "*" in parts
+    ids = {p.lower() for p in parts if p != "*"}
+    return ids, allow_all
+
+
+def _start_app_listener():
+    """Start the app-tunnel listener on an ephemeral ``127.0.0.1`` port and expose it
+    through ``blt.serve_app`` (spec §7, ``start()`` ported from remoteblt bridge).
+
+    Returns the running server, or ``None`` when ``blt.serve_app`` is unavailable or
+    raises — in which case the loopback listener keeps running and the failure is
+    logged, so the flow is never taken down by a missing app tunnel.
+    """
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _AppHandler)
+    httpd.daemon_threads = True
+    port = httpd.server_address[1]
+    try:
+        blt.serve_app(port)
+    except Exception as exc:  # noqa: BLE001 - keep loopback running if serve_app fails
+        blt.error(
+            f"[tunnel] blt.serve_app({port}) failed ({type(exc).__name__}: {exc}); the "
+            f"app tunnel is unavailable, the loopback listener keeps running"
+        )
+        httpd.server_close()
+        return None
+    threading.Thread(
+        target=httpd.serve_forever, name="tunnel-app-http", daemon=True
+    ).start()
+    owner = str(getattr(blt, "user", None) or "") or "(unknown)"
+    if _allow_all_users:
+        allowed = "* (any authenticated user)"
+    else:
+        allowed = ", ".join(sorted(_allowed_users)) or "(owner only)"
+    blt.info(
+        f"[tunnel] app tunnel listening on 127.0.0.1:{port} via blt.serve_app · "
+        f"owner={owner} · allowed_users={allowed}"
+    )
+    return httpd
 
 
 def _write_connection_file(url):
@@ -1684,16 +2067,21 @@ def _run_executor():
 
 
 def tunnel_session_server_flow():
-    global _idle_timeout
+    global _idle_timeout, _allowed_users, _allow_all_users
     port = int(blt.params.get("port", 8766))
     _idle_timeout = float(blt.params.get("idle_timeout", 1800))
+
+    # App tunnel (spec §7): second listener + blt.serve_app, off by default. Parse the
+    # auth policy now so the startup log and the app handler both see it.
+    app_tunnel = bool(blt.params.get("app_tunnel", False))
+    _allowed_users, _allow_all_users = _parse_allowed_users(blt.params.get("allowed_users"))
 
     # Parse device_indexes/warm_device_cache/device_cache_dir and load any persisted
     # cache (spec §6). Bad JSON logs a blt.error and the tunnel still starts.
     _init_device_cache()
 
     try:
-        httpd = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+        httpd = ThreadingHTTPServer(("127.0.0.1", port), _LoopbackHandler)
     except OSError as exc:
         blt.error(
             f"Cannot bind 127.0.0.1:{port} ({exc}). Another tunnel run is probably "
@@ -1707,9 +2095,20 @@ def tunnel_session_server_flow():
     signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     threading.Thread(target=httpd.serve_forever, name="tunnel-http", daemon=True).start()
 
+    # Second (app-tunnel) listener, started only when requested. A serve_app failure
+    # logs and leaves the loopback listener running (handled inside _start_app_listener).
+    app_httpd = _start_app_listener() if app_tunnel else None
+
     _write_connection_file(url)
     blt.info(f"Session tunnel listening on {url}, credentials in {CONNECTION_FILE}")
     blt.info(f"Idle timeout {_idle_timeout:.0f}s · operations: {', '.join(sorted(_ALL_OPS))}")
+    if app_tunnel:
+        if _allow_all_users:
+            allowed = "* (any authenticated user)"
+        else:
+            allowed = ", ".join(sorted(_allowed_users)) or "(owner only)"
+        app_port = app_httpd.server_address[1] if app_httpd is not None else "unavailable"
+        blt.info(f"App tunnel: port {app_port} · allowed_users={allowed}")
     if _device_indexes:
         blt.info(
             f"Device cache indexes: {', '.join(sorted(_device_indexes))} · "
@@ -1717,7 +2116,9 @@ def tunnel_session_server_flow():
         )
     blt.output.update({
         "tunnel_url": url, "port": port, "status": "running",
-        "idle_timeout_s": _idle_timeout, **_stats,
+        "idle_timeout_s": _idle_timeout,
+        "app_tunnel": bool(app_httpd is not None),
+        **_stats,
     })
 
     # Background warm at start when indexes are configured and the persisted cache did
@@ -1738,6 +2139,9 @@ def tunnel_session_server_flow():
             _unwind_all("tunnel flow stopped with contexts still open")
         httpd.shutdown()
         httpd.server_close()
+        if app_httpd is not None:
+            app_httpd.shutdown()
+            app_httpd.server_close()
         try:
             os.remove(CONNECTION_FILE)
         except OSError:

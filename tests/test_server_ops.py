@@ -448,3 +448,70 @@ def test_space_schema_concurrent_builds_do_not_double_build(server, monkeypatch)
 
     assert len(builds) == 1  # built exactly once
     assert results["a"] is results["b"]  # same cached object
+
+
+# ---------------------------------------------------------------------------
+# space_schema start-then-poll (spec §7): wait=False must not block; the status op
+# reports progress and hands back the digest once ready.
+# ---------------------------------------------------------------------------
+
+
+def test_space_schema_wait_false_is_nonblocking_then_polls_ready(server, monkeypatch):
+    release = threading.Event()
+    started = threading.Event()
+    real = server._fetch_flows
+
+    def gated(deadline=None):
+        started.set()
+        assert release.wait(timeout=10.0)  # park the build mid-flight
+        return real(deadline)
+
+    monkeypatch.setattr(server, "_fetch_flows", gated)
+
+    status = server._op_space_schema({"wait": False})
+    assert status["state"] in ("empty", "building")
+    assert "digest" not in status  # cold cache: nothing ready yet
+    assert _spin_until(started.is_set)  # the background build is actually running
+
+    mid = server._op_space_schema_status({})
+    assert mid["state"] == "building"
+    assert "digest" not in mid
+
+    release.set()
+    assert _spin_until(lambda: server._op_space_schema_status({})["state"] == "ready")
+    final = server._op_space_schema_status({})
+    assert final["state"] == "ready"
+    assert final["digest"]["totals"]["flows"] == 3
+    # The default (wait=True) path returns that very same cached digest object.
+    assert server._op_space_schema({}) is final["digest"]
+
+
+def test_space_schema_wait_false_returns_cached_digest_immediately(server):
+    digest = server._op_space_schema({})  # build once (wait=True)
+    status = server._op_space_schema({"wait": False})
+    assert status["state"] == "ready"
+    assert status["digest"] is digest  # no rebuild, same object
+
+
+def test_space_schema_status_registered_and_empty_before_any_build(server):
+    assert "space_schema_status" in server._DISPATCH
+    assert "space_schema_status" in server._ALL_OPS
+    status = server._op_space_schema_status({})
+    assert status["state"] == "empty"
+    assert "digest" not in status
+
+
+# ---------------------------------------------------------------------------
+# ping reports the transport and the authenticated caller (spec §7). The HTTP
+# handler injects these under reserved underscore keys; here we drive the op directly.
+# ---------------------------------------------------------------------------
+
+
+def test_ping_reports_transport_and_user(server):
+    loopback = server._op_ping({})
+    assert loopback["transport"] == "loopback"
+    assert loopback["user"] is None
+
+    app = server._op_ping({"_transport": "app", "_caller_user_id": "USER-7"})
+    assert app["transport"] == "app"
+    assert app["user"] == "USER-7"

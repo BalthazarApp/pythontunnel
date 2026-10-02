@@ -561,3 +561,121 @@ def test_perf_sanity_20k_devices(server):
     # Generous bounds so this catches a pathological regression without being flaky.
     assert load_s < 20.0, f"20k load took {load_s:.1f}s"
     assert lookup_s < 1.0, f"lookup took {lookup_s:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# Byte-budgeted pages for the cache-backed ops (spec §7). The reply shape stays the
+# bare list for old callers; new kwargs opt into the paged dict shape.
+# ---------------------------------------------------------------------------
+
+
+def _big_die(i, wafer, payload_len=5000):
+    return {
+        "id": f"die-{i:06d}", "type": "Die", "name": f"die {i}",
+        "fabrication_date": None, "description": None, "tags": [],
+        "params": {"hierarchy": {"wafer": wafer}, "blob": "x" * payload_len},
+    }
+
+
+def test_cached_devices_bare_list_without_new_kwargs(server):
+    # No wait/max_bytes/offset -> byte-for-byte the pre-§7 bare-list reply.
+    _configure(server, WAFER)
+    server._reload_device_cache(force=True)
+    out = server._op_cached_devices({"index": "wafer", "value": "SECRET_wafer_17"})
+    assert isinstance(out, list)
+    assert [d["id"] for d in out] == ["dev-chip-1"]
+
+
+def test_cached_devices_byte_budget_paging_concatenates_to_full(server):
+    _configure(server, WAFER)
+    server.blt.set_synthetic_devices([_big_die(i, "W1", 5000) for i in range(10)])
+    server._reload_device_cache(force=True)
+
+    collected, offset, pages = [], 0, 0
+    while True:
+        out = server._op_cached_devices(
+            {"index": "wafer", "value": "W1", "offset": offset, "max_bytes": 12_000}
+        )
+        pages += 1
+        assert out["state"] == "ready"
+        assert 1 <= len(out["devices"]) <= 2  # ~5 KB records, 12 KB budget -> 2/page
+        collected.extend(out["devices"])
+        if out["next_offset"] is None:
+            break
+        offset = out["next_offset"]
+        assert pages < 50
+    assert pages > 1  # the budget really did split it into several pages
+    assert [d["id"] for d in collected] == [f"die-{i:06d}" for i in range(10)]
+    assert out["total"] == 10
+
+
+def test_cached_devices_query_byte_budget_paging_concatenates_to_full(server):
+    _configure(server, WAFER)
+    server.blt.set_synthetic_devices([_big_die(i, "W1", 5000) for i in range(10)])
+    server._reload_device_cache(force=True)
+
+    collected, offset, pages = [], 0, 0
+    while True:
+        out = server._op_cached_devices_query({"offset": offset, "max_bytes": 12_000})
+        pages += 1
+        assert 1 <= len(out["devices"]) <= 2
+        assert out["total"] == 10
+        collected.extend(out["devices"])
+        if out["next_offset"] is None:
+            break
+        offset = out["next_offset"]
+        assert pages < 50
+    assert pages > 1
+    assert [d["id"] for d in collected] == [f"die-{i:06d}" for i in range(10)]
+
+
+def test_byte_budget_single_oversize_record_returned_alone(server):
+    _configure(server, WAFER)
+    server.blt.set_synthetic_devices([_big_die(0, "W1", 50_000)])
+    server._reload_device_cache(force=True)
+
+    # A record far larger than the budget still comes back alone, never wedged.
+    q = server._op_cached_devices_query({"max_bytes": 1000})
+    assert len(q["devices"]) == 1
+    assert q["next_offset"] is None
+
+    c = server._op_cached_devices(
+        {"index": "wafer", "value": "W1", "offset": 0, "max_bytes": 1000}
+    )
+    assert len(c["devices"]) == 1
+    assert c["next_offset"] is None
+
+
+# ---------------------------------------------------------------------------
+# cached_devices(wait=False) on a cold cache returns a loading state and does not
+# block; the shim polls until ready (spec §7).
+# ---------------------------------------------------------------------------
+
+
+def test_cached_devices_wait_false_returns_loading_without_blocking(server, monkeypatch):
+    _configure(server, WAFER)
+    server.blt.set_synthetic_devices([_die(i, "W1") for i in range(3)])
+
+    started = threading.Event()
+    release = threading.Event()
+    real = server._fetch_device_cache_pages
+
+    def gated(deadline):
+        started.set()
+        assert release.wait(timeout=10.0)  # park the load mid-flight
+        return real(deadline)
+
+    monkeypatch.setattr(server, "_fetch_device_cache_pages", gated)
+
+    reply = server._op_cached_devices({"index": "wafer", "value": "W1", "wait": False})
+    assert reply["state"] == "loading"
+    assert reply["devices"] == []
+    assert _spin_until(started.is_set)  # a background load really started
+
+    release.set()
+    assert _spin_until(lambda: server._cache_meta["state"] == "ready")
+
+    ready = server._op_cached_devices({"index": "wafer", "value": "W1", "wait": False})
+    assert ready["state"] == "ready"
+    assert {d["id"] for d in ready["devices"]} == {"die-000000", "die-000001", "die-000002"}
+    assert ready["next_offset"] is None

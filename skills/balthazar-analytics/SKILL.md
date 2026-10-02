@@ -17,8 +17,13 @@ clear division of labour:
 - **`blt_analytics`** (Python) fetches the *actual values* through the session tunnel into
   your process and gives you pandas frames. What you do with that data is your business.
 
-The tunnel must be up. If anything fails to connect, run `blt-tunnel doctor` and see the
-**balthazar-tunnel** skill.
+The tunnel must be up. Run your code on the Runner host (loopback, automatic), or connect
+from a remote laptop through the Balthazar app tunnel with
+`blt-tunnel connect "<app url>"` (start the flow with `app_tunnel=true`, then "Open app" in
+Balthazar to get the URL). If anything fails to connect, run `blt-tunnel doctor` (it
+reports the transport and runs the right checks) and see the **balthazar-tunnel** skill.
+Over the MCP server specifically, the app transport needs a cached login first — if you
+see an error asking for it, run `blt-tunnel connect` in a terminal, then retry.
 
 ## Core workflow
 

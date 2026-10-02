@@ -30,12 +30,14 @@ import atexit
 import base64
 import datetime
 import hashlib
+import importlib.util
 import io
 import json
 import os
 import re
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -69,7 +71,11 @@ __all__ = [
     "warn",
     "error",
     "ping",
+    "tunnel_connect",
+    "tunnel_disconnect",
+    "tunnel_transport",
     "TunnelError",
+    "TunnelLoginRequired",
 ]
 
 __balthazar_tunnel__ = True
@@ -83,11 +89,41 @@ _LOAD_TIMEOUT_S = 1800.0
 _QUERY_PAGE_SIZE = 10000
 _HEARTBEAT_INTERVAL_S = 30.0
 
+# App-transport (SPEC §7) knobs.
+_APP_URL_ENV = "BALTHAZAR_SESSION_TUNNEL_APP_URL"
+# One request may not exceed the platform's 60 s app-tunnel cap, so each POST is
+# clamped to just above it; a long op is a quick wait=False call plus polling, not
+# one blocking request.
+_APP_REQUEST_TIMEOUT_S = 65.0
+# Poll a long op's status op this often, printing a one-line progress notice.
+_POLL_INTERVAL_S = 2.0
+# Default byte budget for cache-backed paged ops (server cuts at whole records and
+# returns next_offset; the transport follows it until None).
+_APP_MAX_BYTES = 2_000_000
+# Long ops: op -> the status op the app transport polls while it loads.
+_POLL_OPS = {
+    "space_schema": "space_schema_status",
+    "cached_devices": "device_cache_status",
+    "refresh_device_cache": "device_cache_status",
+}
+# Cache-backed ops whose byte-budgeted pages the app transport follows transparently.
+_PAGED_OPS = ("cached_devices", "cached_devices_query")
+
 _CLIENT_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
 class TunnelError(RuntimeError):
     """The tunnel itself failed (unreachable, bad token, malformed reply)."""
+
+
+class TunnelLoginRequired(TunnelError):
+    """App transport needs an interactive login that this process must not run.
+
+    Raised (instead of blocking on a device-code/browser prompt) when the app
+    transport is used non-interactively — ``$BALTHAZAR_TUNNEL_NONINTERACTIVE=1``,
+    as an MCP stdio server or ``blt-tunnel doctor`` sets — and no cached token
+    works. The fix is to run ``blt-tunnel connect`` in a terminal.
+    """
 
 
 _ERROR_TYPES: dict[str, type[BaseException]] = {
@@ -104,56 +140,352 @@ _ERROR_TYPES: dict[str, type[BaseException]] = {
 # ----------------------------------------------------------------------------
 # Transport
 # ----------------------------------------------------------------------------
+#
+# ``_call`` is transport-agnostic: it pops ``_timeout``, stamps ``client_id`` and
+# hands the (op, kwargs, timeout) to whichever transport is active. Two transports
+# answer the same JSON envelope ``{op, kwargs}`` -> ``{ok, result|error}``:
+#
+# * loopback (unchanged) — POST ``{url}/rpc`` with a bearer token;
+# * app (SPEC §7) — POST ``{tunnel}/rpc`` with only the grant cookie, through the
+#   platform's app tunnel, with login handled by the sibling ``_app_auth`` module.
+#
+# Selection precedence: ``$BALTHAZAR_SESSION_TUNNEL_APP_URL`` > a profile whose
+# ``transport`` is ``"app"`` > the existing loopback profile/env. The resolved
+# transport is cached and rebuilt by ``tunnel_connect``/``tunnel_disconnect``.
 
 
-def _connection() -> tuple[str, str]:
-    url = os.environ.get("BALTHAZAR_SESSION_TUNNEL_URL")
-    token = os.environ.get("BALTHAZAR_SESSION_TUNNEL_TOKEN")
-    if url and token:
-        return url, token
+def _raise_remote(err: Mapping) -> None:
+    """Re-raise a remote error as its mapped builtin type, carrying the traceback.
+
+    Unknown types become :class:`TunnelError`. The remote traceback (present on the
+    app transport, SPEC §7) is attached as ``exc.remote_traceback`` so a caller can
+    see where the Runner failed; it is ``None`` on the loopback transport.
+    """
+    exc_type = _ERROR_TYPES.get(err.get("type", ""), TunnelError)
+    exc = exc_type(err.get("message") or "unknown remote error")
+    try:
+        exc.remote_traceback = err.get("traceback")
+    except (AttributeError, TypeError):  # pragma: no cover - builtins allow it
+        pass
+    raise exc
+
+
+def _unwrap(payload: Mapping) -> Any:
+    """Turn a decoded ``{ok, result|error}`` reply into a result or raised error."""
+    if payload.get("ok"):
+        return payload.get("result")
+    _raise_remote(payload.get("error") or {})
+
+
+def _to_jsonable(value: Any) -> Any:
+    """Convert numpy-ish values (anything with ``tolist()``) to builtins, recursively.
+
+    The app transport serializes with plain ``json``; a numpy array/scalar passed as
+    a kwarg would otherwise fail to encode (SPEC §7: "values with tolist() are
+    converted before sending").
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return {key: _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(item) for item in value]
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        return _to_jsonable(tolist())
+    return value
+
+
+class _LoopbackTransport:
+    """The original transport: bearer-token POST to a local ``{url}/rpc``."""
+
+    kind = "loopback"
+
+    def __init__(self, url: str, token: str):
+        self.url = url
+        self.token = token
+
+    def call(self, op: str, kwargs: dict, timeout: float) -> Any:
+        body = json.dumps({"op": op, "kwargs": kwargs}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.url}/rpc", data=body, method="POST",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.token}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:400]
+            raise TunnelError(f"Tunnel returned HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise TunnelError(
+                f"Cannot reach the tunnel at {self.url} ({exc.reason}). Is the flow still running?"
+            ) from exc
+        except (ValueError, OSError) as exc:
+            raise TunnelError(f"Malformed tunnel reply: {exc}") from exc
+        return _unwrap(payload)
+
+
+class _AppTransport:
+    """Talks to the platform app tunnel: cookie-only POST, polling, page following.
+
+    The 60 s per-request cap forces long ops into start-then-poll (SPEC §7). For
+    ``space_schema`` / ``cached_devices`` / ``refresh_device_cache`` the shim always
+    sends ``wait=False`` and, while the reply is a ``{state: loading|empty}``
+    sentinel, polls the matching status op every 2 s with a one-line progress notice.
+    Cache-backed ops (``cached_devices`` / ``cached_devices_query``) send ``max_bytes``
+    and have their ``next_offset`` pages followed transparently.
+    """
+
+    kind = "app"
+
+    def __init__(self, session: Any):
+        self.session = session
+
+    def _rpc(self, op: str, kwargs: dict, timeout: float) -> Any:
+        body = json.dumps({"op": op, "kwargs": kwargs}).encode("utf-8")
+        per_request = min(timeout, _APP_REQUEST_TIMEOUT_S)
+        try:
+            status, raw = self.session.post_json("/rpc", body, per_request)
+        except Exception as exc:  # noqa: BLE001 - translate the one auth case, re-raise the rest
+            login_required = getattr(_app_auth_module, "LoginRequired", None)
+            if login_required is not None and isinstance(exc, login_required):
+                raise TunnelLoginRequired(str(exc)) from exc
+            raise
+        if status == 404:
+            raise TunnelError("tunnel flow not running / app tunnel not active (HTTP 404)")
+        if status == 504:
+            raise TunnelError("call exceeded the 60 s app-tunnel limit (HTTP 504)")
+        if status != 200:
+            detail = raw.decode("utf-8", "replace")[:400] if isinstance(raw, (bytes, bytearray)) else str(raw)
+            raise TunnelError(f"App tunnel returned HTTP {status}: {detail}")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, AttributeError) as exc:
+            raise TunnelError(f"Malformed tunnel reply: {exc}") from exc
+        return _unwrap(payload)
+
+    def call(self, op: str, kwargs: dict, timeout: float) -> Any:
+        kwargs = _to_jsonable(dict(kwargs))
+        if op in _PAGED_OPS:
+            kwargs.setdefault("max_bytes", _APP_MAX_BYTES)
+        status_op = _POLL_OPS.get(op)
+        if status_op is None:
+            return self._follow_pages(op, kwargs, self._rpc(op, kwargs, timeout), timeout)
+
+        # Long op: the shim always sends wait=False (a blocking build would hit the
+        # 60 s cap) and polls the status op while the server reports progress.
+        intended_wait = kwargs.get("wait", True)
+        kwargs = {**kwargs, "wait": False}
+        result = self._rpc(op, kwargs, timeout)
+        if intended_wait and _is_loading(result):
+            final = self._poll(status_op, kwargs.get("client_id"), timeout)
+            if op == "refresh_device_cache":
+                return final  # post-reload status, as wait=True would have returned
+            if _is_error(final):
+                raise TunnelError(_state_error(op, final))
+            if op == "space_schema":
+                return final.get("digest")  # the status carries the built digest
+            result = self._rpc(op, kwargs, timeout)  # cached_devices: fetch now ready
+
+        if op == "space_schema":
+            if _is_error(result):
+                raise TunnelError(_state_error(op, result))
+            return result.get("digest") if isinstance(result, dict) else result
+        if op == "refresh_device_cache":
+            return result
+        if _is_error(result):
+            raise TunnelError(_state_error(op, result))
+        return self._follow_pages(op, kwargs, result, timeout)
+
+    def _poll(self, status_op: str, client_id: Any, timeout: float) -> dict:
+        deadline = time.time() + timeout
+        kwargs = {"client_id": client_id} if client_id else {}
+        while time.time() < deadline:
+            status = self._rpc(status_op, dict(kwargs), timeout)
+            status = status if isinstance(status, dict) else {}
+            _print_progress(status_op, status)
+            if status.get("state") in ("ready", "error"):
+                return status
+            time.sleep(_POLL_INTERVAL_S)
+        raise TunnelError(f"timed out waiting for {status_op} to finish")
+
+    def _follow_pages(self, op: str, kwargs: dict, first: Any, timeout: float) -> Any:
+        """Follow byte-budgeted ``next_offset`` pages (SPEC §7) for cache-backed ops.
+
+        ``cached_devices`` is returned as a bare list (its old shape); the paged
+        ``cached_devices_query`` reply is returned whole with its pages concatenated
+        and ``next_offset`` cleared.
+        """
+        if op not in _PAGED_OPS or not isinstance(first, dict) or "next_offset" not in first:
+            return first  # unpaged reply (e.g. a legacy bare list) — nothing to follow
+        devices = list(first.get("devices") or [])
+        nxt = first.get("next_offset")
+        while nxt is not None:
+            page = self._rpc(op, {**kwargs, "offset": nxt}, timeout)
+            if not isinstance(page, dict):
+                devices.extend(page or [])
+                break
+            devices.extend(page.get("devices") or [])
+            nxt = page.get("next_offset")
+        if op == "cached_devices":
+            return devices
+        merged = dict(first)
+        merged["devices"] = devices
+        merged["next_offset"] = None
+        return merged
+
+
+# A long op is "still loading" while its state is any non-terminal one. The server
+# uses "building" for the schema and "loading" for the device cache, plus "empty"
+# before either starts; "ready"/"error" are the terminal states.
+_LOADING_STATES = ("empty", "building", "loading", "pending")
+
+
+def _is_loading(result: Any) -> bool:
+    return isinstance(result, dict) and result.get("state") in _LOADING_STATES
+
+
+def _is_error(result: Any) -> bool:
+    return isinstance(result, dict) and result.get("state") == "error"
+
+
+def _state_error(op: str, status: dict) -> str:
+    return status.get("error") or f"{op} failed on the server (state=error)"
+
+
+def _print_progress(status_op: str, status: dict) -> None:
+    """One-line stderr progress notice while a long op loads (app transport only)."""
+    label = "space schema" if status_op == "space_schema_status" else "device cache"
+    detail = ""
+    progress = status.get("progress")
+    if isinstance(progress, Mapping):
+        loaded, total = progress.get("loaded_flows"), progress.get("total_flows")
+        if loaded is not None or total is not None:
+            detail = f" ({loaded}/{total} flows)"
+    else:
+        bits = [f"{key}={status[key]}" for key in ("loaded", "count") if status.get(key) is not None]
+        if bits:
+            detail = f" ({', '.join(bits)})"
+    print(f"tunnel: {label} {status.get('state', 'loading')}…{detail}", file=sys.stderr)
+
+
+_app_auth_module: Any = None
+
+
+def _load_app_auth() -> Any:
+    """Load the sibling ``_app_auth`` module by file path and return its ``AppSession``.
+
+    Loaded by path (not imported as a package) so the stdlib-only shim keeps working
+    when copied out next to its ``_app_auth.py`` sibling, with no package on the path.
+    """
+    global _app_auth_module
+    if _app_auth_module is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "_app_auth.py")
+        if not os.path.exists(path):
+            raise TunnelError(
+                f"No app-tunnel auth module at {path}; the app tunnel needs "
+                "session_tunnel/_app_auth.py alongside this shim."
+            )
+        spec = importlib.util.spec_from_file_location("blt_session_app_auth", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _app_auth_module = module
+    return _app_auth_module.AppSession
+
+
+_transport: Any = None
+_transport_lock = threading.RLock()
+
+
+def _load_profile() -> Optional[dict]:
     try:
         with open(CONNECTION_FILE, encoding="utf-8") as fh:
             conf = json.load(fh)
     except FileNotFoundError:
-        raise TunnelError(
-            f"No tunnel connection file at {CONNECTION_FILE}. Start the "
-            "'flows/tunnel_session_server.py' flow in Balthazar first."
-        ) from None
+        return None
     except (OSError, ValueError) as exc:
         raise TunnelError(f"Unreadable connection file {CONNECTION_FILE}: {exc}") from exc
-    return url or conf["url"], token or conf["token"]
+    return conf if isinstance(conf, dict) else None
+
+
+def _noninteractive() -> bool:
+    """Whether the app transport must never start an interactive login (SPEC §7).
+
+    Set ``$BALTHAZAR_TUNNEL_NONINTERACTIVE=1`` in an MCP stdio server or
+    ``blt-tunnel doctor``: a device-code/browser prompt would block it for minutes.
+    """
+    return os.environ.get("BALTHAZAR_TUNNEL_NONINTERACTIVE") == "1"
+
+
+def _app_session_from_profile(app_url: str, profile: dict, *, interactive: Optional[bool] = None) -> Any:
+    AppSession = _load_app_auth()
+    if interactive is None:
+        interactive = not _noninteractive()
+    return AppSession(
+        app_url,
+        site=profile.get("site"),
+        login=profile.get("login", "device"),
+        username=profile.get("username"),
+        ca_file=profile.get("ca_file"),
+        client_id=profile.get("client_id", "blt-frontend2"),
+        interactive=interactive,
+    )
+
+
+def _build_transport() -> Any:
+    """Resolve the active transport by SPEC §7 precedence, or ``None`` if unconfigured."""
+    profile = _load_profile()
+    app_profile = profile if (isinstance(profile, dict) and profile.get("transport") == "app") else {}
+
+    app_url = os.environ.get(_APP_URL_ENV) or app_profile.get("app_url")
+    if app_url:
+        return _AppTransport(_app_session_from_profile(app_url, app_profile))
+
+    env_url = os.environ.get("BALTHAZAR_SESSION_TUNNEL_URL")
+    env_token = os.environ.get("BALTHAZAR_SESSION_TUNNEL_TOKEN")
+    url = env_url or (profile.get("url") if profile else None)
+    token = env_token or (profile.get("token") if profile else None)
+    if url and token:
+        return _LoopbackTransport(url, token)
+    return None
+
+
+def _active_transport() -> Any:
+    global _transport
+    with _transport_lock:
+        if _transport is None:
+            _transport = _build_transport()
+        if _transport is None:
+            raise TunnelError(
+                "No tunnel connection. Start the 'flows/tunnel_session_server.py' flow "
+                f"(loopback writes {CONNECTION_FILE}), run 'blt-tunnel connect <app url>' "
+                f"for a remote app tunnel, or set ${_APP_URL_ENV}."
+            )
+        return _transport
+
+
+def _set_transport(transport: Any) -> None:
+    """Install ``transport`` as active and clear caches that key off the old server."""
+    global _transport, _advertised_indexes_cache
+    with _transport_lock:
+        _transport = transport
+    _advertised_indexes_cache = None
+    _root.clear()
+
+
+def _reset_transport() -> None:
+    """Drop the cached transport so the next call re-resolves env/profile afresh."""
+    _set_transport(None)
 
 
 def _call(op: str, **kwargs: Any) -> Any:
     # ``_timeout`` is popped before serialization, so it never reaches the wire; it
     # lets calls that may trigger a device-cache load wait far longer than a read.
     timeout = kwargs.pop("_timeout", None) or _TIMEOUT_S
-    url, token = _connection()
     kwargs.setdefault("client_id", _CLIENT_ID)
-    body = json.dumps({"op": op, "kwargs": kwargs}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{url}/rpc", data=body, method="POST",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:400]
-        raise TunnelError(f"Tunnel returned HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise TunnelError(
-            f"Cannot reach the tunnel at {url} ({exc.reason}). Is the flow still running?"
-        ) from exc
-    except (ValueError, OSError) as exc:
-        raise TunnelError(f"Malformed tunnel reply: {exc}") from exc
-
-    if payload.get("ok"):
-        return payload.get("result")
-    err = payload.get("error") or {}
-    raise _ERROR_TYPES.get(err.get("type", ""), TunnelError)(
-        err.get("message") or "unknown remote error"
-    )
+    return _active_transport().call(op, kwargs, timeout)
 
 
 # ----------------------------------------------------------------------------
@@ -1058,6 +1390,108 @@ def warn(message: str) -> None:
 
 def error(message: str) -> None:
     _call("log", level="error", message=str(message))
+
+
+# ----------------------------------------------------------------------------
+# Remote app tunnel: connect / disconnect / which transport (SPEC §7)
+# ----------------------------------------------------------------------------
+
+
+def tunnel_connect(
+    app_url: str,
+    *,
+    login: str = "device",
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    site: Optional[str] = None,
+    ca_file: Optional[str] = None,
+) -> dict[str, Any]:
+    """Log in to a remote Balthazar **app tunnel**, ping it, and save the profile.
+
+    ``app_url`` is the address of the opened tunnel app (``.../app-tunnel/<runner>/
+    <flow>/?space_id=...``). ``login`` is ``device`` (default), ``browser`` or
+    ``password`` (then ``username``/``password`` are required). Logs in (caching only
+    the refresh token, under ``~/.config/balthazar/remote.json``), pings through the
+    tunnel to confirm access, and writes the connection profile (0600, **no tokens**)
+    so later processes reconnect without this call. Returns the ping info, including
+    the ``transport``, the connected ``user`` id and the tunnel's ``flow_run_id``.
+    """
+    AppSession = _load_app_auth()
+    session = AppSession(
+        app_url,
+        site=site,
+        login=login,
+        username=username,
+        password=password,
+        ca_file=ca_file,
+        client_id="blt-frontend2",
+    )
+    transport = _AppTransport(session)
+    info_reply = transport.call("ping", {"client_id": _CLIENT_ID}, _TIMEOUT_S)
+    info: dict[str, Any] = dict(info_reply) if isinstance(info_reply, dict) else {}
+    # Guarantee the keys the CLI reads, mapping the server's ``user`` <-> ``user_id``.
+    info.setdefault("transport", "app")
+    if not info.get("user_id") and info.get("user"):
+        info["user_id"] = info["user"]
+    if not info.get("user") and info.get("user_id"):
+        info["user"] = info["user_id"]
+    info.setdefault("user_id", None)
+    info.setdefault("flow_run_id", None)
+    info.setdefault("flow_name", None)
+
+    profile: dict[str, Any] = {
+        "transport": "app",
+        "app_url": app_url,
+        "login": login,
+        "client_id": "blt-frontend2",
+    }
+    if site:
+        profile["site"] = site
+    if ca_file:
+        profile["ca_file"] = ca_file
+    if username:
+        profile["username"] = username
+    _write_profile(profile)
+
+    _set_transport(transport)
+    _root.update(info)
+    return info
+
+
+def tunnel_disconnect(*, forget: bool = False) -> None:
+    """Remove the saved connection profile; with ``forget`` also drop the cached token.
+
+    ``forget=True`` deletes the cached refresh token for an app profile, so the next
+    connect logs in from scratch. Removing the profile falls back to the loopback
+    env/profile (if any) or to "not connected".
+    """
+    profile = _load_profile()
+    if forget and isinstance(profile, dict) and profile.get("transport") == "app" and profile.get("app_url"):
+        try:
+            _app_session_from_profile(profile["app_url"], profile).forget()
+        except Exception:  # noqa: BLE001 - forgetting a token must never block disconnect
+            pass
+    try:
+        os.remove(CONNECTION_FILE)
+    except FileNotFoundError:
+        pass
+    _reset_transport()
+
+
+def tunnel_transport() -> str:
+    """Which transport is active: ``"loopback"``, ``"app"`` or ``"none"``."""
+    try:
+        return _active_transport().kind
+    except TunnelError:
+        return "none"
+
+
+def _write_profile(profile: Mapping) -> None:
+    """Write the connection profile atomically with 0600 permissions (no tokens)."""
+    descriptor = os.open(CONNECTION_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+        json.dump(dict(profile), fh)
+    os.chmod(CONNECTION_FILE, 0o600)
 
 
 @atexit.register

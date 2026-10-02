@@ -57,6 +57,9 @@ __all__ = [
     "reset_faults",
     "logged_messages",
     "set_synthetic_devices",
+    "user",
+    "serve_app",
+    "serve_app_calls",
 ]
 
 
@@ -251,6 +254,12 @@ _LOG: list[tuple[str, str]] = []
 FAULTS: dict[str, set] = {"fail_pages": set(), "fail_runs": set()}
 _history_calls: dict[str, int] = defaultdict(int)
 
+# App-tunnel support (spec §7). A real Runner exposes ``blt.user`` (the starting
+# user's id) and ``blt.serve_app(port)``. Tests set ``user`` (via monkeypatch) and read
+# back the recorded ``serve_app`` port(s) to assert the second listener bound correctly.
+user: str | None = None
+_serve_app_calls: list[int] = []
+
 # Test hook (spec §6 perf sanity check): when set, ``search_devices`` serves these raw
 # device records instead of the fixture space, so a test can drive a large synthetic
 # space through the server's device cache without perturbing the fixture counts.
@@ -268,13 +277,26 @@ def set_synthetic_devices(records: list[dict] | None) -> None:
 
 
 def reset_faults() -> None:
-    """Clear injected faults, per-flow call counters and the synthetic device override
-    (call between tests)."""
-    global _synthetic_records
+    """Clear injected faults, per-flow call counters, the synthetic device override and
+    the app-tunnel state (call between tests)."""
+    global _synthetic_records, user
     FAULTS["fail_pages"] = set()
     FAULTS["fail_runs"] = set()
     _history_calls.clear()
     _synthetic_records = None
+    _serve_app_calls.clear()
+    user = None
+
+
+def serve_app(port: int) -> None:
+    """Record the port a listener was published on (the real Runner publishes the app
+    tunnel here). Tests read it back via :func:`serve_app_calls`."""
+    _serve_app_calls.append(int(port))
+
+
+def serve_app_calls() -> list[int]:
+    """The ports passed to :func:`serve_app`, in order (for assertions)."""
+    return list(_serve_app_calls)
 
 
 def fail_page(n: int) -> None:
