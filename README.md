@@ -206,6 +206,43 @@ which is worse to develop against. `pop(key, default)` raises `KeyError` to matc
 real proxy, which ignores the default. `del params[key]` works, since removal is the one
 thing `update` cannot express.
 
+### Device cache (large spaces)
+
+A space with 250k+ devices is slow to page on every call, and the data changes rarely.
+Set the `device_indexes` flow parameter and the server loads every device once (full
+records, in memory) and keeps a `str(value) → [device ids]` map per index:
+
+```jsonc
+// device_indexes (a JSON string); the value may also be
+// {"path": "hierarchy.wafer", "device_type": "Die"} to restrict one type.
+{"wafer": "hierarchy.wafer"}
+```
+
+Then, from your local code:
+
+```python
+blt.cached_devices("wafer", "W123")      # or the generated accessor:
+blt.get_wafer_devices("W123")            # tunnel-only; not on a real Runner
+blt.device_cache_status()                # {state, count, built_at, indexes, …}
+blt.refresh_device_cache(wait=True)      # full reload (atomic; keeps old on failure)
+blt.tunnel_cached_devices_query(device_type="Die", keys=["lot"])  # whole-space, paged
+```
+
+The load is orchestrated like `space_schema` (many small main-thread jobs off a worker
+thread), so other clients' ops interleave; concurrent callers wait for the one load.
+`space_schema` builds from the cache when it is ready, and an `update_device_params`
+write updates the cache write-through. `cached_devices(..., refresh=True)` re-fetches one
+value's known ids (picking up changes, dropping vanished devices) but cannot discover
+*new* devices — that needs `refresh_device_cache`.
+
+Related flow parameters: `warm_device_cache` (default on when any index is configured)
+loads in the background at start; `device_cache_dir` (default `~/.balthazar_tunnel_cache`)
+is where the cache is persisted on the Runner — `<dir>/<space-or-root-flow key>/devices.pkl`
+plus a JSON meta sidecar, written atomically (dir `0700`, files `0600`, since it holds
+space data) — so a restart does not reload 250k devices. A whole-space
+`tunnel_cached_devices_query` can produce a response far larger than the request cap, so
+the server pages it (`offset`/`limit`) and the shim stitches the pages back together.
+
 ### Demo configuration
 
 Both v2 demos start with `DEVICE_TYPE`, `DEVICE_NAME` and `MAX_BATCH_DEVICES`. The last
@@ -219,3 +256,55 @@ and dispatch only through an explicit operation allowlist. Anything that can rea
 connection file gets full read access to the space and can create flow runs, so treat
 the token as a credential. `blt.secrets` is deliberately not tunnelled — v2 raises
 `NotImplementedError` on it rather than forwarding.
+
+---
+
+# Analytics with your AI agent
+
+A coding agent (Claude Code, Cursor, Copilot) can answer data questions about your
+Balthazar space: it learns the space's **structure** from schema tools, then writes Python
+that pulls the **real data** through the v2 session tunnel and plots it. This builds on the
+v2 tunnel above; v1 is untouched.
+
+## Install and set up
+
+```bash
+uv pip install -e ".[all]"     # package `blt_analytics` + CLI + MCP server
+blt-tunnel setup               # register the MCP server, copy the skills, update AGENTS.md
+blt-tunnel doctor              # check the connection file, ping, schema, pandas, mcp
+```
+
+`blt-tunnel setup` is idempotent and prints what it changed: it writes the `balthazar-schema`
+MCP server entry into `.mcp.json` / `.cursor/mcp.json` / `.vscode/mcp.json`, copies the
+`skills/*` into `.claude/skills/` and `.agents/skills/` (add `--global` for the user-level
+dirs), and maintains a block in `AGENTS.md`. The tunnel flow
+(`flows/tunnel_session_server.py`) must be running in the space first (see the v2 section).
+
+## Three layers, three jobs
+
+| Layer | What it is | What it does |
+|---|---|---|
+| **Tools** | `balthazar-schema` MCP server (or the `blt-schema` CLI) | Tell the agent **what exists** — device types, params, flows, runs, inputs/outputs, with dtypes, shapes and coverage. **Schema only, never values.** |
+| **Skills** | `balthazar-tunnel`, `balthazar-analytics` | Tell the agent **how to work** — the setup, the schema-first workflow, the gotchas. |
+| **`blt` / `blt_analytics`** | the shim + the pandas layer | Fetch the **actual data** into the user's process (`devices_df`, `runs_df`, …) and plot it. |
+
+The split is the point: the agent reads *schema* to decide what to pull, then pulls and
+plots the *values* locally. Figures attach to a Balthazar run with `publish(...)` only when
+you ask to save or share. See `skills/balthazar-analytics/` for the full workflow and
+worked examples.
+
+## Large spaces: the server-side device cache
+
+On a space with hundreds of thousands of devices, paging every `search_devices` call is
+slow. The tunnel flow can keep a **server-side device cache** — all device records by id,
+plus a lookup table per configured *index*. Configure it with the flow parameters
+`device_indexes` (e.g. `{"wafer": "hierarchy.wafer"}`), `warm_device_cache` and
+`device_cache_dir`.
+
+- `blt_analytics.devices_df(...)` uses the cache automatically when it is ready (no API
+  change), and `devices_df(index="wafer", value="W123")` pulls one index value straight
+  from it. `overview()` lists the configured indexes under `device_indexes`.
+- Directly on the shim: `blt.get_wafer_devices("W123")` / `blt.cached_devices(...)`,
+  `blt.device_cache_status()`, and `blt.refresh_device_cache()` to reload after new devices
+  land. These accessors are **tunnel-only** (not on the real Runner); the first load can
+  take minutes. See `skills/balthazar-tunnel/` and `skills/balthazar-analytics/`.
