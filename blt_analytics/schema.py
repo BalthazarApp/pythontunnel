@@ -9,8 +9,8 @@ measurement value ever appears (the one exception the digest sanctions —
 timestamps in date ``first``/``last`` — is a timestamp, not a measurement). That
 boundary is what lets the tools be called freely.
 
-They all read one :func:`get_digest`. The digest is either served whole by the
-tunnel (``tunnel_space_schema``) or, against a real/fake Runner module, built
+They all read one :func:`get_digest`. The digest is either served whole by the v3
+bridge (``blt.tunnel.space_schema``) or, against a real/fake Runner module, built
 locally here from fetched records via :func:`blt_analytics.digest.build_digest`.
 The local path needs record conversion, so this module carries small private
 serializers (``_device_to_record`` / ``_flow_to_record`` / ``_run_to_record``)
@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import copy
 import difflib
+import sys
+import time
 from typing import Any, Iterable
 
 from blt_analytics import _blt
@@ -50,6 +52,14 @@ __all__ = [
 _MAX_LISTING = 100
 # Scalar leaf kinds, for default column selection in load_snippet.
 _SCALAR_KINDS = ("number", "integer", "string", "bool", "date")
+
+# v3 ``blt.tunnel.space_schema()`` builds the digest server-side and reports
+# ``{state, progress, digest?}``; while it is ``building``/``empty`` we re-poll.
+# (The Remote may also poll internally; this loop is harmless either way and makes
+# the schema layer correct against a bridge that returns the raw state.) Both are
+# module-level so tests can shrink the interval.
+_SCHEMA_POLL_INTERVAL_S = 2.0
+_SCHEMA_POLL_TIMEOUT_S = 600.0
 
 # Module state. ``_injected`` is a test override that short-circuits every build;
 # ``_memo`` is the memoized real digest. Both cleared by ``reset()``.
@@ -79,9 +89,9 @@ def get_digest(refresh: bool = False) -> dict:
     """Return the space digest, memoized.
 
     Call order: an injected digest wins (tests); otherwise the memoized one unless
-    ``refresh``; otherwise it is built. When the located module is the tunnel shim
-    its ``tunnel_space_schema(refresh)`` serves the digest directly; if that is
-    unavailable (a Runner too old — ``RuntimeError``/``AttributeError``) or the
+    ``refresh``; otherwise it is built. When the located module is the v3 bridge its
+    ``blt.tunnel.space_schema(refresh)`` serves the digest directly (polled until
+    ready); if that op is unavailable (a bridge too old — ``AttributeError``) or the
     module is a real/fake Runner, the digest is built locally from fetched records.
 
     This is the whole space digest (spec §3). The narrower tools (``overview``,
@@ -99,15 +109,50 @@ def get_digest(refresh: bool = False) -> dict:
 
 def _acquire_digest(refresh: bool) -> dict:
     blt = _blt.get_blt()
-    if _blt.is_tunnel():
+    ns = _blt.tunnel_ns()  # the v3 tunnel namespace, or None (real Runner)
+    if ns is not None:
         try:
-            return blt.tunnel_space_schema(refresh)
-        except (RuntimeError, AttributeError):
-            # Runner too old to host the op (or shim not yet extended): fall back
-            # to building the digest locally from the same read surface.
+            return _v3_space_schema(ns, refresh)
+        except AttributeError:
+            # Bridge predates ``tunnel.space_schema``: build locally from the read
+            # surface. A server-side build *error* is surfaced (RuntimeError), not
+            # masked by a slow, projection-less local rebuild.
             pass
     devices, flows, runs = _fetch_records(blt)
     return _digest_mod.build_digest(devices, flows, runs)
+
+
+def _v3_space_schema(ns: Any, refresh: bool) -> dict:
+    """The space digest via ``blt.tunnel.space_schema()``, polling until ``ready``.
+
+    ``space_schema(refresh=False)`` returns ``{state, progress, digest?}``. The
+    server builds in the background, so while ``state`` is ``building``/``empty`` we
+    re-poll every ``_SCHEMA_POLL_INTERVAL_S`` (``refresh`` only on the first call, to
+    force a rebuild without restarting the build each loop). ``state == "error"``
+    raises ``RuntimeError`` with the server's message; ``ready`` returns the digest.
+    """
+    deadline = time.monotonic() + _SCHEMA_POLL_TIMEOUT_S
+    want_refresh = bool(refresh)
+    notified = False
+    while True:
+        result = ns.space_schema(refresh=want_refresh)
+        want_refresh = False  # never re-trigger the build on subsequent polls
+        if not isinstance(result, dict):
+            raise RuntimeError(f"space_schema returned {type(result).__name__}, expected a dict")
+        state = result.get("state")
+        if state == "ready":
+            return result.get("digest") or {}
+        if state == "error":
+            raise RuntimeError(result.get("error") or "space_schema failed on the bridge")
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"space_schema did not become ready within {_SCHEMA_POLL_TIMEOUT_S:.0f}s "
+                f"(last state={state!r})"
+            )
+        if not notified:
+            print("blt_analytics: building the space schema on the bridge…", file=sys.stderr)
+            notified = True
+        time.sleep(_SCHEMA_POLL_INTERVAL_S)
 
 
 def _fetch_records(blt: Any) -> tuple[list[dict], list[dict], list[dict]]:
@@ -186,7 +231,7 @@ def _flow_to_record(flow: Any) -> dict:
 
 
 def _run_to_record(run: Any) -> dict:
-    # The shim exposes device_ids; the real/fake module exposes .devices (objects).
+    # A reflected run may expose device_ids; the real/fake module exposes .devices.
     device_ids = list(getattr(run, "device_ids", None) or [])
     if not device_ids:
         device_ids = [getattr(d, "id", d) for d in (getattr(run, "devices", None) or [])]
@@ -299,10 +344,10 @@ def overview() -> dict:
     flow with its run count and date range. Schema only; take exact device-type and
     flow names from here, then narrow with the other tools.
 
-    On the session tunnel it also reports ``device_indexes`` (``{name: dotted
-    path}``) when the flow configures a server-side device cache (SPEC §6) — the
-    index names to pass to ``devices_df(index=..., value=...)``. Names and paths
-    only, never index values.
+    On the v3 bridge it also reports ``device_indexes`` (``{name: dotted path}``)
+    when the flow configures a server-side device cache (SPEC §6) — the index names
+    to pass to ``devices_df(index=..., value=...)``. Names and paths only, never
+    index values.
     """
     d = get_digest()
     device_types = {
@@ -333,28 +378,29 @@ def overview() -> dict:
         out["flows_truncated"] = dropped_flows
 
     # Configured server-side device indexes (names + dotted paths only — schema, no
-    # values), from the tunnel's extended ``ping`` (SPEC §6). Skipped when a digest
-    # is injected (tests), so the pure-digest tools stay offline and deterministic.
+    # values), from the v3 ``describe`` reply (SPEC §6). Skipped when a digest is
+    # injected (tests), so the pure-digest tools stay offline and deterministic.
     if _injected is None:
-        indexes = _device_indexes_from_ping()
+        indexes = _device_indexes_from_describe()
         if indexes:
             out["device_indexes"] = indexes
     return out
 
 
-def _device_indexes_from_ping() -> dict:
+def _device_indexes_from_describe() -> dict:
     """``{index_name: dotted_path}`` for the configured device indexes, or ``{}``.
 
-    Reads the tunnel's extended ``ping`` (``device_indexes``), which only the shim
-    carries; anything that goes wrong (not a tunnel, no connection, an old shim, a
-    malformed reply) collapses to ``{}`` so ``overview`` never fails over it. Only
-    names and paths surface — never index *values*, which are device data.
+    On the v3 bridge, the index names/paths come from the ``describe`` reply's
+    ``device_indexes`` (``_blt.describe_info()``). Anything that goes wrong (not a
+    bridge, no connection, a malformed reply) collapses to ``{}`` so ``overview``
+    never fails over it. Only names and paths surface — never index *values*, which
+    are device data.
     """
     try:
-        if not _blt.is_tunnel():
+        if _blt.bridge_version() != 3:
             return {}
-        info = _blt.get_blt().ping() or {}
-    except Exception:  # noqa: BLE001 - offline / old shim / no tunnel -> nothing to add
+        info = _blt.describe_info() or {}
+    except Exception:  # noqa: BLE001 - offline / no bridge -> nothing to add
         return {}
     raw = info.get("device_indexes") if isinstance(info, dict) else None
     if not isinstance(raw, dict):

@@ -76,15 +76,15 @@ One row per device.
   Index names come from `overview()`'s `device_indexes`. Raises a clear error on a real
   Runner. Passing only one of the two raises `ValueError`.
 
-**Server-side device cache.** On the session tunnel, when the flow configures a device
+**Server-side device cache.** On the bridge, when the flow configures a device
 cache that is `"ready"`, `devices_df` reads from it (whole-frame via `cached_devices_query`,
 or one index value via `cached_devices`) instead of paging `search_devices`; otherwise the
 behaviour is unchanged. These cache-backed paths **bypass the on-disk frame cache** (the
 server holds the authoritative, write-through copy), so `refresh=` differs there: it is a
 no-op on the whole-frame path, and on the `index=`/`value=` path `refresh=True` re-fetches
 only the **already-known** ids of that value (not newly-added devices — reload server-side
-with `blt.refresh_device_cache()` for those). The first load can take minutes. See the
-**balthazar-tunnel** skill for configuring and inspecting the cache.
+for those with `blt.tunnel.refresh_device_cache()`). The first load can take minutes. See
+the **balthazar-tunnel** skill for configuring and inspecting the cache.
 
 ### `runs_df(flow=None, *, columns=None, status=None, since=None, max_runs=100_000, refresh=False) -> DataFrame`
 

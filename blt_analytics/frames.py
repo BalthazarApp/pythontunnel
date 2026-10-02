@@ -2,10 +2,10 @@
 
 Where :mod:`blt_analytics.schema` withholds measurements, this module hands them
 over — it is the user's own process, and ``frames`` exists to pull the data in and
-shape it. It talks to whatever :func:`blt_analytics._blt.get_blt` locates (the v2
-tunnel shim or a real Runner module), using only the attributes the two share, and
-passes the shim-only projection kwargs (``keys=``/``scalars_only=``) solely when
-:func:`blt_analytics._blt.is_tunnel` is true.
+shape it. It talks to whatever :func:`blt_analytics._blt.get_blt` locates (the v3
+reflection bridge or a real Runner module), using only the attributes the two share.
+On the bridge it can also lean on the server-side device cache through the
+``blt.tunnel`` namespace (SPEC §6).
 
 Column flattening mirrors :mod:`blt_analytics.digest` so the dotted paths the schema
 tools report work verbatim as ``columns=``: a small, stable nested dict flattens to
@@ -64,7 +64,7 @@ def _pd():
 
 
 def _as_dict(obj: Any) -> dict:
-    """A plain dict from a dict or a Mapping (e.g. the shim's ``device.params``)."""
+    """A plain dict from a dict or a Mapping (e.g. a reflected ``device.params``)."""
     if obj is None:
         return {}
     if isinstance(obj, dict):
@@ -73,6 +73,18 @@ def _as_dict(obj: Any) -> dict:
         return dict(obj)
     except Exception:  # noqa: BLE001 - not mapping-like
         return {}
+
+
+def _dev_get(device: Any, name: str, default: Any = None) -> Any:
+    """Read a device field from either an object (attribute) or a plain dict record.
+
+    A real Runner hands back objects (``device.params``); a v3 tunnel op may hand
+    back ``CachedDevice`` objects *or* plain JSON records — this reads both so
+    :func:`_devices_to_frame` is agnostic to which acquisition path fed it.
+    """
+    if isinstance(device, dict):
+        return device.get(name, default)
+    return getattr(device, name, default)
 
 
 def _nan():
@@ -237,7 +249,7 @@ def devices_df(
     * no ``index``/``value`` — when talking to the tunnel and the device cache
       reports ``state == "ready"``, the whole (optionally type-filtered) set is read
       from the cache via ``cached_devices_query`` instead of being paged. If the
-      cache is cold, or the shim is too old to host these ops, the behaviour is
+      cache is cold, or the bridge is too old to host these ops, the behaviour is
       unchanged (page ``search_devices``).
 
     Both server-cache paths **bypass the on-disk frame cache** (see
@@ -300,14 +312,14 @@ def _devices_to_frame(devices, columns):
     for device in devices:
         identity_rows.append(
             {
-                "id": str(getattr(device, "id", "") or ""),
-                "name": getattr(device, "name", ""),
-                "type": getattr(device, "type", ""),
-                "fabrication_date": getattr(device, "fabrication_date", None),
-                "tags": list(getattr(device, "tags", []) or []),
+                "id": str(_dev_get(device, "id", "") or ""),
+                "name": _dev_get(device, "name", ""),
+                "type": _dev_get(device, "type", ""),
+                "fabrication_date": _dev_get(device, "fabrication_date", None),
+                "tags": list(_dev_get(device, "tags", []) or []),
             }
         )
-        params_list.append(_as_dict(getattr(device, "params", {})))
+        params_list.append(_as_dict(_dev_get(device, "params", {})))
 
     if columns is None:
         extra_cols, flat_rows = _flatten_many(params_list)
@@ -341,10 +353,8 @@ def _build_devices_df(device_type, columns, include_archived):
         kwargs["type"] = device_type
     if not include_archived:
         kwargs["archived"] = False  # only unarchived; None would include archived too
-    if _blt.is_tunnel() and columns is not None:
-        # Push a projection down: only the top-level param keys we will read.
-        kwargs["keys"] = _projection_keys(columns)
-
+    # No projection pushdown: the v3 bridge forwards ``search_devices`` straight to
+    # the real Runner, which has no ``keys=`` kwarg, so we always page plainly.
     devices = list(blt.search_devices(**kwargs))
     return _devices_to_frame(devices, columns)
 
@@ -352,68 +362,66 @@ def _build_devices_df(device_type, columns, include_archived):
 def _devices_df_from_server_cache(device_type, columns, refresh):
     """Whole-space (or type-filtered) devices from the server cache, or ``None``.
 
-    Returns a frame read through ``cached_devices_query`` when (a) the located
-    module is the tunnel shim, and (b) the shim exposes the device-cache ops, and
+    Returns a frame read through the device cache's *query* op when (a) the located
+    module is the v3 bridge, (b) it exposes the device-cache ops via
+    ``blt.tunnel.device_cache_status()`` + ``blt.tunnel.cached_devices_query``, and
     (c) the cache reports ``state == "ready"``. Otherwise returns ``None`` so
-    :func:`devices_df` falls through to its unchanged paging path. An older shim
-    without ``device_cache_status`` / ``cached_devices_query`` raises
-    ``AttributeError``, which we treat as "no device cache" and swallow. This path
-    deliberately does not read or write the on-disk frame cache (``refresh`` is a
-    no-op here — reload server-side with ``blt.refresh_device_cache()``).
-    """
-    try:
-        if not _blt.is_tunnel():
-            return None
-    except Exception:  # noqa: BLE001 - no module located -> paging path
-        return None
+    :func:`devices_df` falls through to its unchanged paging path.
 
-    blt = _blt.get_blt()
+    An older bridge without these ops raises ``AttributeError``, which we treat as
+    "no device cache" and swallow. This path deliberately does not read or write the
+    on-disk frame cache (``refresh`` is a no-op here — reload server-side with
+    ``blt.tunnel.refresh_device_cache()``).
+    """
+    ns = _blt.tunnel_ns()  # the v3 tunnel namespace, or None (real Runner)
+    if ns is None:
+        return None
     try:
-        status = blt.device_cache_status()
+        status = ns.device_cache_status()
     except AttributeError:
-        return None  # shim predates the device cache (SPEC §6)
+        return None  # bridge predates the device cache (SPEC §6)
     except Exception:  # noqa: BLE001 - status unreachable -> page instead
         return None
     if not isinstance(status, dict) or status.get("state") != "ready":
         return None
 
+    keys = _projection_keys(columns)
     try:
-        devices = list(
-            blt.tunnel_cached_devices_query(
-                device_type=device_type, keys=_projection_keys(columns)
-            )
-        )
+        devices = list(ns.cached_devices_query(device_type=device_type, keys=keys))
     except AttributeError:
         return None  # has status but not the query op; fall back to paging
     return _devices_to_frame(devices, columns)
 
 
 def _devices_df_by_index(device_type, columns, index, value, refresh):
-    """Devices for one configured index value, via ``blt.cached_devices`` (tunnel)."""
+    """Devices for one configured index value, via the bridge's ``cached_devices``.
+
+    Routes through ``blt.tunnel.cached_devices(index, value, refresh=refresh)``.
+    """
     try:
         tunnel = _blt.is_tunnel()
     except Exception:  # noqa: BLE001
         tunnel = False
     if not tunnel:
         raise RuntimeError(
-            "devices_df(index=, value=) needs the session tunnel's server-side "
-            "device cache, but the located balthazar module is a real Runner, which "
-            "has no such cache. Use devices_df(device_type=..., columns=[...]) "
-            "instead, or run against the tunnel."
+            "devices_df(index=, value=) needs the bridge's server-side device cache, "
+            "but the located balthazar module is a real Runner, which has no such "
+            "cache. Use devices_df(device_type=..., columns=[...]) instead, or run "
+            "against the bridge."
         )
 
-    blt = _blt.get_blt()
-    fetch = getattr(blt, "cached_devices", None)
+    ns = _blt.tunnel_ns()
+    fetch = getattr(ns, "cached_devices", None) if ns is not None else None
     if fetch is None:
         raise RuntimeError(
-            "devices_df(index=, value=): this tunnel shim has no cached_devices(); "
-            "it predates the server-side device cache (SPEC §6). Update the tunnel "
-            "flow and the shim, or use devices_df(device_type=..., columns=[...])."
+            "devices_df(index=, value=): this bridge has no cached_devices(); it "
+            "predates the server-side device cache (SPEC §6). Update the bridge, or "
+            "use devices_df(device_type=..., columns=[...])."
         )
 
     devices = list(fetch(index, value, refresh=refresh))
     if device_type is not None:
-        devices = [d for d in devices if getattr(d, "type", None) == device_type]
+        devices = [d for d in devices if _dev_get(d, "type", None) == device_type]
     return _devices_to_frame(devices, columns)
 
 
@@ -453,9 +461,16 @@ def _to_ts(value):
 
 
 def _device_ids(run) -> list[str]:
-    """Device ids from either shape: the shim's ``.device_ids`` or real ``.devices``."""
+    """Device ids from either shape: a ``.device_ids`` list or real ``.devices``.
+
+    The v3 bridge hands back a ``RemoteObject`` whose ``__getattr__`` returns a
+    callable method proxy for *any* missing public name (never ``None``), so a plain
+    ``getattr(run, "device_ids", None) is not None`` would wrongly treat the absent
+    attribute as present and then fail to iterate the proxy. Only use ``device_ids``
+    when it actually resolved to a list/tuple; otherwise fall through to ``.devices``
+    (the real Runner and the v3 bridge's reflected run object)."""
     dids = getattr(run, "device_ids", None)
-    if dids is not None:
+    if isinstance(dids, (list, tuple)):
         return [str(x) for x in dids]
     out: list[str] = []
     for device in getattr(run, "devices", None) or []:

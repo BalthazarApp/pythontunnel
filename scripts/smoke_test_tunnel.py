@@ -1,17 +1,17 @@
 #!/usr/bin/env python
-"""Live smoke test for the Balthazar v2 session tunnel.
+"""Live smoke test for the Balthazar v3 reflection bridge.
 
-Exercises the real tunnel end-to-end from the client side: it locates the v2 shim
-exactly the way ``blt_analytics`` does (via ``blt_analytics._blt.get_blt()``, so it
-never accidentally picks up the v1 one-shot shim at the repo root), then runs a
-sequence of numbered checks against a running ``flows/tunnel_session_server.py``.
+Exercises the real bridge end-to-end from the client side: it locates the balthazar
+module exactly the way ``blt_analytics`` does (via ``blt_analytics._blt.get_blt()``),
+confirms it is the **v3 bridge** (``bridge_version() == 3``), and runs a sequence of
+numbered checks against the running flow. Tunnel ops live under ``blt.tunnel`` and
+identity comes from ``describe``.
 
-Run it on the Runner machine that hosts the tunnel (loopback), with the connection
-file at ``~/.balthazar_session_tunnel.json`` (or the
-``BALTHAZAR_SESSION_TUNNEL_URL`` / ``BALTHAZAR_SESSION_TUNNEL_TOKEN`` env vars):
+Setup: start ``flows/tunnel_bridge.py`` in Balthazar, click "Open app", copy the
+snippet URL, and ``blt-tunnel connect "<url>"`` (writes ``~/.balthazar_bridge.json``).
 
     uv run python scripts/smoke_test_tunnel.py              # read-only (default)
-    uv run python scripts/smoke_test_tunnel.py --write      # also creates flow runs
+    uv run python scripts/smoke_test_tunnel.py --write      # also create flow runs
     uv run python scripts/smoke_test_tunnel.py --skip-schema
     uv run python scripts/smoke_test_tunnel.py --device-type Chip --flow "IV sweep" --limit 10
 
@@ -20,10 +20,9 @@ summary (counts and names only — never a dump of params or values). Failures d
 stop the run; the script exits non-zero if any check FAILed.
 
 **Read-only by default.** Without ``--write`` nothing is created or modified: the
-checks only read (ping, searches, schema, data frames). ``--write`` is the only flag
-that mutates the space, and even then it only creates small throwaway flow runs
-(a tiny plot, one output primitive, and one intentionally-FAILED run); it never
-writes device params.
+checks only read (describe, searches, schema, data frames). ``--write`` creates small
+throwaway flow runs (a tiny plot via ``plt.show``, one ``blt.output`` primitive, and
+one intentionally-FAILED nested run); it never writes device params.
 """
 
 from __future__ import annotations
@@ -41,8 +40,6 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 # Make ``import blt_analytics`` resolve to this repo's package even when the script
 # is launched as ``scripts/smoke_test_tunnel.py`` (whose own dir, not the repo root,
 # lands on sys.path). Appending — not inserting — keeps an installed copy preferred.
-# Note this also puts the repo-root v1 ``balthazar.py`` on the path, but that is
-# harmless: get_blt() detects the v1 shim and loads the v2 shim by path regardless.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.append(_REPO_ROOT)
@@ -91,8 +88,8 @@ class State:
 
     def __init__(self) -> None:
         self.blt: Any = None
-        self.is_tunnel: bool = False
-        self.ping: Optional[dict] = None
+        self.version: Optional[int] = None  # 3 (bridge) or None (runner)
+        self.describe: Optional[dict] = None
         self.device_indexes: dict[str, str] = {}
         self.sample_devices: list = []
         self.flows: list = []
@@ -108,9 +105,16 @@ class State:
 # ---------------------------------------------------------------------------
 
 
-def _require_ping(state: State) -> None:
-    if state.ping is None:
-        raise SkipCheck("tunnel not reachable (see the ping check above)")
+def _require_describe(state: State) -> None:
+    if state.describe is None:
+        raise SkipCheck("bridge not reachable (see the describe check above)")
+
+
+def _describe(state: State) -> dict:
+    """The v3 ``describe`` payload (``blt._session.description``), or ``{}``."""
+    from blt_analytics import _blt
+
+    return _blt.describe_info() or {}
 
 
 def _dotted_get(container: Any, dotted: str) -> Any:
@@ -141,43 +145,33 @@ def _resolve_device_type(state: State, args: argparse.Namespace) -> Optional[str
 
 
 def check_connection(state: State) -> str:
-    path = getattr(state.blt, "CONNECTION_FILE",
-                   os.path.expanduser("~/.balthazar_session_tunnel.json"))
-    app_url = os.environ.get("BALTHAZAR_SESSION_TUNNEL_APP_URL")
-    url = os.environ.get("BALTHAZAR_SESSION_TUNNEL_URL")
-    token = os.environ.get("BALTHAZAR_SESSION_TUNNEL_TOKEN")
+    app_url = os.environ.get("BALTHAZAR_BRIDGE_URL")
+    path = os.path.expanduser("~/.balthazar_bridge.json")
     if app_url:
-        return "using BALTHAZAR_SESSION_TUNNEL_APP_URL (remote app transport)"
-    if url and token:
-        return "using BALTHAZAR_SESSION_TUNNEL_URL / _TOKEN env vars (loopback)"
+        return "using BALTHAZAR_BRIDGE_URL"
     if os.path.exists(path):
-        # Either a loopback connection file or a remote app-tunnel profile — the
-        # transport reported by the ping check below tells them apart.
-        return f"connection/app profile present ({path})"
+        return f"bridge profile present ({path})"
     raise RuntimeError(
-        f"no connection/app profile at {path} and no BALTHAZAR_SESSION_TUNNEL_* env "
-        'vars — start flows/tunnel_session_server.py in Balthazar (loopback), or run '
-        '`blt-tunnel connect "<app url>"` for a remote app tunnel'
+        f"no bridge profile at {path} and no BALTHAZAR_BRIDGE_URL — start "
+        'flows/tunnel_bridge.py in Balthazar, "Open app", and run '
+        '`blt-tunnel connect "<app url>"`'
     )
 
 
-def check_ping(state: State) -> str:
-    info = state.blt.ping()
-    state.ping = info
+def check_describe(state: State) -> str:
+    info = _describe(state)
+    state.describe = info
     state.device_indexes = dict(info.get("device_indexes") or {})
     idx = ", ".join(sorted(state.device_indexes)) or "none"
-    transport = info.get("transport") or ("app" if state.is_tunnel else "runner")
-    who = info.get("user") or info.get("user_id")
-    who_part = f" user={who}" if who else ""
     return (
-        f"transport={transport}{who_part} flow={info.get('flow_name')!r} "
-        f"flow_run_id={info.get('flow_run_id')} depth={info.get('depth')} "
-        f"device_indexes=[{idx}]"
+        f"describe: protocol={info.get('protocol')} "
+        f"caller={info.get('user')} owner={info.get('owner')} "
+        f"shared={info.get('shared')} device_indexes=[{idx}]"
     )
 
 
 def check_search_devices(state: State, args: argparse.Namespace) -> str:
-    _require_ping(state)
+    _require_describe(state)
     devs = list(state.blt.search_devices(limit=args.limit))
     state.sample_devices = devs
     types = sorted({getattr(d, "type", "?") for d in devs})
@@ -186,7 +180,7 @@ def check_search_devices(state: State, args: argparse.Namespace) -> str:
 
 
 def check_search_flows(state: State, args: argparse.Namespace) -> str:
-    _require_ping(state)
+    _require_describe(state)
     flows = list(state.blt.search_flows(limit=20))
     state.flows = flows
     # Resolve which flow drives the later flow-scoped checks.
@@ -210,7 +204,7 @@ def check_search_flows(state: State, args: argparse.Namespace) -> str:
 
 
 def check_run_history(state: State, args: argparse.Namespace) -> str:
-    _require_ping(state)
+    _require_describe(state)
     if state.target_flow is None:
         raise SkipCheck("no target flow available")
     flow = state.target_flow
@@ -224,7 +218,7 @@ def check_run_history(state: State, args: argparse.Namespace) -> str:
 
 
 def check_fetch_visualizations(state: State) -> str:
-    _require_ping(state)
+    _require_describe(state)
     viz_id = None
     for run in state.runs:
         ids = getattr(run, "visualization_ids", None) or []
@@ -241,8 +235,8 @@ def check_fetch_visualizations(state: State) -> str:
 
 
 def check_device_cache_status(state: State) -> str:
-    _require_ping(state)
-    status = state.blt.device_cache_status()
+    _require_describe(state)
+    status = state.blt.tunnel.device_cache_status()
     state.cache_status = status
     indexes = list((status.get("indexes") or {}).keys())
     return (
@@ -252,10 +246,10 @@ def check_device_cache_status(state: State) -> str:
 
 
 def check_device_cache_index(state: State, args: argparse.Namespace) -> str:
-    _require_ping(state)
+    _require_describe(state)
     if not state.device_indexes:
-        raise SkipCheck("no device_indexes configured on this tunnel")
-    status = state.cache_status or state.blt.device_cache_status()
+        raise SkipCheck("no device_indexes configured on this bridge")
+    status = state.cache_status or state.blt.tunnel.device_cache_status()
     cache_state = status.get("state")
     if cache_state != "ready":
         if cache_state in ("loading", "empty"):
@@ -270,13 +264,10 @@ def check_device_cache_index(state: State, args: argparse.Namespace) -> str:
     spec = (status.get("indexes") or {}).get(index_name) or {}
     path = spec.get("path") or state.device_indexes[index_name]
     dtype = spec.get("device_type")
-    top_key = path.split(".", 1)[0]
 
     kwargs: dict[str, Any] = {"limit": 50}
     if dtype:
         kwargs["type"] = dtype
-    if state.is_tunnel:
-        kwargs["keys"] = [top_key]
     value = _MISSING
     for dev in state.blt.search_devices(**kwargs):
         candidate = _dotted_get(dict(getattr(dev, "params", {}) or {}), path)
@@ -286,12 +277,14 @@ def check_device_cache_index(state: State, args: argparse.Namespace) -> str:
     if value is _MISSING:
         raise SkipCheck(f"no sampled device had a value at index path {path!r}")
 
+    # ``get_<index>_devices`` is generated on the v3 drop-in; ``cached_devices`` lives
+    # under ``blt.tunnel``.
     accessor = getattr(state.blt, f"get_{index_name}_devices")
     t0 = time.perf_counter()
     via_accessor = list(accessor(value))
     t_acc = (time.perf_counter() - t0) * 1000.0
     t0 = time.perf_counter()
-    via_cached = list(state.blt.cached_devices(index_name, value))
+    via_cached = list(state.blt.tunnel.cached_devices(index_name, value))
     t_cached = (time.perf_counter() - t0) * 1000.0
 
     match = "match" if len(via_accessor) == len(via_cached) else "MISMATCH"
@@ -307,7 +300,7 @@ def _schema():
 
 
 def check_schema_overview(state: State, args: argparse.Namespace) -> str:
-    _require_ping(state)
+    _require_describe(state)
     if args.skip_schema:
         raise SkipCheck("--skip-schema")
     schema = _schema()
@@ -326,7 +319,7 @@ def check_schema_overview(state: State, args: argparse.Namespace) -> str:
 
 
 def check_device_schema(state: State, args: argparse.Namespace) -> str:
-    _require_ping(state)
+    _require_describe(state)
     if args.skip_schema:
         raise SkipCheck("--skip-schema")
     dtype = _resolve_device_type(state, args)
@@ -339,7 +332,7 @@ def check_device_schema(state: State, args: argparse.Namespace) -> str:
 
 
 def check_flow_schema(state: State, args: argparse.Namespace) -> str:
-    _require_ping(state)
+    _require_describe(state)
     if args.skip_schema:
         raise SkipCheck("--skip-schema")
     flow_ref = args.flow or getattr(state.target_flow, "name", None)
@@ -355,7 +348,7 @@ def check_flow_schema(state: State, args: argparse.Namespace) -> str:
 
 
 def check_find(state: State, args: argparse.Namespace) -> str:
-    _require_ping(state)
+    _require_describe(state)
     if args.skip_schema:
         raise SkipCheck("--skip-schema")
     res = _schema().find("a")
@@ -364,7 +357,7 @@ def check_find(state: State, args: argparse.Namespace) -> str:
 
 
 def check_devices_df(state: State, args: argparse.Namespace) -> str:
-    _require_ping(state)
+    _require_describe(state)
     try:
         import pandas  # noqa: F401
     except ImportError:
@@ -379,7 +372,7 @@ def check_devices_df(state: State, args: argparse.Namespace) -> str:
 
 
 def check_runs_df(state: State, args: argparse.Namespace) -> str:
-    _require_ping(state)
+    _require_describe(state)
     try:
         import pandas  # noqa: F401
     except ImportError:
@@ -394,7 +387,7 @@ def check_runs_df(state: State, args: argparse.Namespace) -> str:
 
 
 def check_write_run(state: State) -> str:
-    _require_ping(state)
+    _require_describe(state)
     import warnings
 
     import matplotlib.pyplot as plt
@@ -407,7 +400,7 @@ def check_write_run(state: State) -> str:
         ax.plot([0, 1, 2, 3], [0, 1, 4, 9], marker="o")
         ax.set_title("tunnel smoke test")
         with warnings.catch_warnings():
-            # The Agg backend warns that it cannot "show"; we only want the shim's
+            # The Agg backend warns that it cannot "show"; we only want the bridge's
             # upload side effect, so silence that one cosmetic warning.
             warnings.simplefilter("ignore", UserWarning)
             plt.show()  # inside the context -> figure lands on this run
@@ -418,7 +411,7 @@ def check_write_run(state: State) -> str:
 
 
 def check_write_nested_fail(state: State) -> str:
-    _require_ping(state)
+    _require_describe(state)
     blt = state.blt
 
     outer = blt.enter_new_flow_run(name="tunnel smoke test (outer)")
@@ -446,12 +439,13 @@ def check_write_nested_fail(state: State) -> str:
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="smoke_test_tunnel.py",
-        description="Live smoke test for the Balthazar v2 session tunnel "
+        description="Live smoke test for the Balthazar v3 reflection bridge "
                     "(read-only unless --write).",
     )
     p.add_argument("--write", action="store_true",
-                   help="opt-in: also create throwaway flow runs (plot + output + an "
-                        "intentionally-FAILED nested run). Never writes device params.")
+                   help="opt-in: also create throwaway flow runs (enter_new_flow_run + "
+                        "plt.show + output, then a nested exception -> FAILED). Never "
+                        "writes device params.")
     p.add_argument("--skip-schema", action="store_true",
                    help="skip the schema tools (space_schema can be slow on big spaces)")
     p.add_argument("--device-type", default=None,
@@ -470,29 +464,37 @@ def main(argv: Optional[list[str]] = None) -> int:
     state = State()
 
     mode = "WRITE (creates flow runs)" if args.write else "read-only"
-    print(f"Balthazar session-tunnel smoke test — mode: {mode}", flush=True)
+    print(f"Balthazar bridge smoke test — mode: {mode}", flush=True)
 
     # Locate the balthazar module exactly as blt_analytics does. get_blt() prefers an
-    # importable real/v2 module and otherwise loads the v2 shim by path; it never
-    # returns the v1 one-shot shim.
+    # importable real module / v3 drop-in, otherwise loads the v3 bridge by profile.
     try:
         from blt_analytics import _blt
         state.blt = _blt.get_blt()
-        state.is_tunnel = _blt.is_tunnel()
+        state.version = _blt.bridge_version()
     except Exception as exc:  # noqa: BLE001
         print(f"[FAIL]  0. locate balthazar module  {type(exc).__name__}: {exc}", flush=True)
         print("\n0 passed, 1 failed, 0 skipped", flush=True)
         return 1
+    label = "v3 reflection bridge" if state.version == 3 else "real runner module"
     print(
-        f"        located balthazar: "
-        f"{'v2 tunnel shim' if state.is_tunnel else 'real runner module'} "
+        f"        located balthazar: {label} "
         f"({getattr(state.blt, '__file__', '?')})",
         flush=True,
     )
 
+    if state.version != 3:
+        print(
+            "[FAIL]  0. this smoke test needs the v3 bridge, but located "
+            f"{label}. Run `blt-tunnel connect \"<url>\"` first.",
+            flush=True,
+        )
+        print("\n0 passed, 1 failed, 0 skipped", flush=True)
+        return 1
+
     h = Harness()
-    h.run("connection file / env present", lambda: check_connection(state))
-    h.run("ping", lambda: check_ping(state))
+    h.run("bridge profile / env present", lambda: check_connection(state))
+    h.run("describe", lambda: check_describe(state))
     h.run("search_devices(limit)", lambda: check_search_devices(state, args))
     h.run("search_flows(limit=20)", lambda: check_search_flows(state, args))
     h.run("search_flow_run_history(first flow)", lambda: check_run_history(state, args))

@@ -2,7 +2,7 @@
 
 The ``fakes`` package is importable because ``pythonpath = ["tests"]`` in
 pyproject puts the tests directory on ``sys.path`` — deliberately *not* the repo
-root, which would let a bare ``import balthazar`` pick up the v1 one-shot shim. The
+root, so a bare ``import balthazar`` resolves the way it does in production. The
 fake real module is injected explicitly via ``sys.modules`` here instead.
 """
 

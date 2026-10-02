@@ -44,17 +44,17 @@ __all__ = ["cached", "space_key", "cache_dir", "clear", "DEFAULT_TTL"]
 
 DEFAULT_TTL = 3600  # one hour
 _ENV_DIR = "BLT_ANALYTICS_CACHE_DIR"
-_CONNECTION_FILE = os.path.expanduser("~/.balthazar_session_tunnel.json")
+_BRIDGE_PROFILE = os.path.expanduser("~/.balthazar_bridge.json")
 
 _MISS = object()
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
-# Memoized server root ``flow_id`` per located-module + tunnel-URL. ``space_key`` runs
-# on *every* ``cached()`` lookup — cache hits included — so without this a hit still
-# paid for a ``blt.ping()`` round trip. Keyed by ``(id(module), tunnel_url)`` so that
-# reconnecting to a different tunnel (a freshly loaded shim module and/or a new URL)
-# re-pings and yields a fresh namespace. Cleared only by process exit (and by tests).
-_PING_CACHE: dict[tuple[int, str], str] = {}
+# Memoized bridge root id per located-module + bridge-URL. ``space_key`` runs on
+# *every* ``cached()`` lookup — cache hits included — so without this a hit still
+# paid for a ``describe`` round trip. Keyed by ``(id(module), bridge_url)`` so that
+# reconnecting to a different bridge (a freshly loaded drop-in and/or a new URL)
+# re-queries and yields a fresh namespace. Cleared only by process exit (and tests).
+_ROOT_CACHE: dict[tuple[int, str], str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -87,34 +87,39 @@ def _attr_id(blt: Any, name: str) -> Optional[str]:
     return str(ident) if ident else None
 
 
-def _tunnel_url() -> str:
-    url = os.environ.get("BALTHAZAR_SESSION_TUNNEL_URL")
+def _bridge_url() -> str:
+    url = os.environ.get("BALTHAZAR_BRIDGE_URL")
     if url:
         return url
     try:
-        with open(_CONNECTION_FILE, encoding="utf-8") as fh:
-            return str(json.load(fh).get("url", ""))
+        with open(_BRIDGE_PROFILE, encoding="utf-8") as fh:
+            return str(json.load(fh).get("app_url", ""))
     except Exception:  # noqa: BLE001 - absence just means "no url component"
         return ""
 
 
-def _root_flow_id(blt: Any, url: str) -> str:
-    """The server's root ``flow_id`` from ``ping()``, memoized per process.
+def _root_id(blt: Any, url: str) -> str:
+    """The bridge's root id from ``describe``, memoized per process.
 
-    The memo (see :data:`_PING_CACHE`) turns a per-``cached()``-call round trip into a
-    single ping for the life of the connection. Only a *successful* ping is cached: a
-    failure returns ``""`` (the url-alone fallback) without memoizing it, so a
-    transient outage does not pin the key to the fallback for the whole process.
+    The memo (see :data:`_ROOT_CACHE`) turns a per-``cached()``-call round trip into a
+    single ``describe`` for the life of the connection. Only a *successful* lookup is
+    cached: a failure returns ``""`` (the url-alone fallback) without memoizing it, so
+    a transient outage does not pin the key to the fallback for the whole process.
     """
     memo_key = (id(blt), url)
-    if memo_key in _PING_CACHE:
-        return _PING_CACHE[memo_key]
+    if memo_key in _ROOT_CACHE:
+        return _ROOT_CACHE[memo_key]
     try:
-        info = blt.ping() or {}
-        root = str(info.get("flow_id") or "")
-    except Exception:  # noqa: BLE001 - offline / no ping -> url alone, not memoized
+        info = _blt.describe_info() or {}
+    except Exception:  # noqa: BLE001 - offline / no describe -> url alone, not memoized
         return ""
-    _PING_CACHE[memo_key] = root
+    root = str(
+        info.get("flow_run")
+        or info.get("flow_run_id")
+        or info.get("owner")
+        or ""
+    )
+    _ROOT_CACHE[memo_key] = root
     return root
 
 
@@ -123,14 +128,14 @@ def space_key(blt: Any = None) -> str:
 
     The choice, documented because the spec left it open (§4 cache):
 
-    1. an explicit ``blt.space.id`` when the module exposes one — the cleanest,
-       space-scoped and stable across reconnects;
-    2. on the **tunnel shim**, a hash of the connection URL plus the server's root
-       ``flow_id`` from ``ping()``. Session and run ids churn per connection, so
-       they are deliberately *not* used; the endpoint + root flow pins the space a
-       tunnel is attached to without a value ever entering the key;
-    3. on a **real Runner** module (no space object, not a tunnel), the flow id —
-       the most stable space-scoped handle available there.
+    1. on the **v3 bridge**, a hash of the bridge URL plus a root id from
+       ``describe`` (flow run, else the owner). The endpoint + root pins the space a
+       bridge is attached to without a measurement value ever entering the key. The
+       bridge is checked first because a reflected ``blt.space`` would otherwise
+       resolve to a method proxy, not a real id;
+    2. on a **real Runner** module, an explicit ``blt.space.id`` when it exposes one
+       (the cleanest, space-scoped and stable), else the flow id — the most stable
+       space-scoped handle available there.
 
     Any failure collapses to ``"default"`` so caching never breaks the data path.
     """
@@ -139,19 +144,19 @@ def space_key(blt: Any = None) -> str:
     except Exception:  # noqa: BLE001 - no module located -> shared default bucket
         return "default"
 
-    sid = _attr_id(blt, "space")
-    if sid:
-        return "space-" + _slug(sid)
-
     try:
         tunnel = _blt.is_tunnel()
     except Exception:  # noqa: BLE001
-        tunnel = bool(getattr(blt, "__balthazar_tunnel__", False))
+        tunnel = getattr(blt, "__balthazar_tunnel__", False) == 3
 
     if tunnel:
-        url = _tunnel_url()
-        root = _root_flow_id(blt, url)
+        url = _bridge_url()
+        root = _root_id(blt, url)
         return "tunnel-" + _short_hash(f"{url}|{root}")
+
+    sid = _attr_id(blt, "space")
+    if sid:
+        return "space-" + _slug(sid)
 
     sid = _attr_id(blt, "flow") or _attr_id(blt, "session") or _attr_id(blt, "flow_run")
     if sid:

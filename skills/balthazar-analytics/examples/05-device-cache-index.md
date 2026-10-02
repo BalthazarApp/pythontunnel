@@ -40,7 +40,8 @@ plt.show()
   portable `devices_df(device_type="Die", columns=[...])` and filter the frame instead;
   on the tunnel that *also* reads the cache when it is ready.
 - The **first** `devices_df` call after the tunnel starts may block for minutes while the
-  cache loads (watch `blt.device_cache_status()`). Later calls are fast.
+  cache loads (watch `blt.tunnel.device_cache_status()`). Later calls are fast.
 - `refresh=True` here re-fetches only the dies already known for `W123` (re-reading their
   current params); it will not surface dies added to the wafer since the cache was built.
-  For new devices, run `import balthazar as blt; blt.refresh_device_cache()` first.
+  For new devices, reload the cache first: `import balthazar as blt;
+  blt.tunnel.refresh_device_cache()`.

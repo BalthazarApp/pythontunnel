@@ -14,16 +14,16 @@ clear division of labour:
   coverage. They return **schema only, never measurement values**, so you call them freely.
   Available as MCP tools from server **`balthazar-schema`**, or as the CLI
   `blt-schema <tool> [args…] [--json]` when MCP isn't wired up.
-- **`blt_analytics`** (Python) fetches the *actual values* through the session tunnel into
+- **`blt_analytics`** (Python) fetches the *actual values* through the tunnel into
   your process and gives you pandas frames. What you do with that data is your business.
 
-The tunnel must be up. Run your code on the Runner host (loopback, automatic), or connect
-from a remote laptop through the Balthazar app tunnel with
-`blt-tunnel connect "<app url>"` (start the flow with `app_tunnel=true`, then "Open app" in
-Balthazar to get the URL). If anything fails to connect, run `blt-tunnel doctor` (it
-reports the transport and runs the right checks) and see the **balthazar-tunnel** skill.
-Over the MCP server specifically, the app transport needs a cached login first — if you
-see an error asking for it, run `blt-tunnel connect` in a terminal, then retry.
+The tunnel must be up — the **v3 reflection bridge**, over the Balthazar app tunnel: start
+`flows/tunnel_bridge.py`, click "Open app" in Balthazar, copy the snippet/URL, and
+`blt-tunnel connect "<app url>"` (or `balthazar_remote.connect(...)` directly in Python).
+If anything fails to connect, run `blt-tunnel doctor` (it reports the bridge and runs the
+right checks) and see the **balthazar-tunnel** skill. Over the MCP server specifically, the
+app tunnel needs a cached login first — if you see an error asking for it, run
+`blt-tunnel connect` in a terminal, then retry.
 
 ## Core workflow
 
@@ -130,8 +130,10 @@ device cache** (SPEC §6), which `devices_df` uses automatically — no API chan
   `index=`/`value=` path `refresh=True` re-fetches only the **already-known** device ids
   for that value (it will not surface brand-new devices). The **first** cache load can take
   minutes; a call that triggers it blocks. To pick up newly-added devices, ask the tunnel
-  to reload (`import balthazar as blt; blt.refresh_device_cache()`), then call `devices_df`
-  again. See the **balthazar-tunnel** skill for cache configuration and status.
+  to reload, then call `devices_df` again — on **v3** that is
+  `import balthazar as blt; blt.tunnel.refresh_device_cache()`, on the legacy **v2** shim
+  `blt.refresh_device_cache()`. See the **balthazar-tunnel** skill for cache configuration
+  and status.
 
 ## Presenting results
 

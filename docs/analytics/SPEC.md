@@ -1,3 +1,5 @@
+> Superseded by `docs/v3/SPEC.md` for transport (the v3 reflection bridge). Historical; kept for the schema / digest contract.
+
 # Analytics tools: interface spec
 
 The shared contract for the analytics work on branch `feature/analytics-tools`. Several

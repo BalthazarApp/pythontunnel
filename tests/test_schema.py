@@ -11,7 +11,6 @@ string ever leaks into any tool's JSON output.
 from __future__ import annotations
 
 import json
-import types
 
 import pytest
 
@@ -285,43 +284,6 @@ def test_get_digest_memoized_and_refresh(fake_blt, monkeypatch):
     refreshed = schema.get_digest(refresh=True)
     assert calls["n"] == 1
     assert refreshed is not first
-
-
-def test_get_digest_uses_tunnel_op_when_tunnel(monkeypatch):
-    sentinel = {"version": 1, "built_at": BUILT_AT, "totals": {}, "device_types": {}, "flows": {}}
-    fake_tunnel = types.SimpleNamespace(
-        __balthazar_tunnel__=True,
-        tunnel_space_schema=lambda refresh=False: sentinel,
-    )
-    monkeypatch.setattr(schema._blt, "get_blt", lambda: fake_tunnel)
-    monkeypatch.setattr(schema._blt, "is_tunnel", lambda: True)
-    assert schema.get_digest() is sentinel
-
-
-def test_get_digest_falls_back_when_tunnel_op_unavailable(monkeypatch):
-    def boom(refresh=False):
-        raise RuntimeError("space_schema unavailable on this Runner")
-
-    recs = fixture_space.to_records()
-
-    def search_devices(**_):
-        from fakes import fake_blt as fb
-
-        return fb.search_devices()
-
-    fake_tunnel = types.SimpleNamespace(
-        __balthazar_tunnel__=True,
-        tunnel_space_schema=boom,
-        search_devices=search_devices,
-        search_flows=lambda **_: __import__("fakes.fake_blt", fromlist=["x"]).search_flows(),
-        search_flow_run_history=lambda **k: __import__("fakes.fake_blt", fromlist=["x"]).search_flow_run_history(**k),
-    )
-    monkeypatch.setattr(schema._blt, "get_blt", lambda: fake_tunnel)
-    monkeypatch.setattr(schema._blt, "is_tunnel", lambda: True)
-
-    d = schema.get_digest()
-    assert d["totals"]["devices"] == len(recs["devices"])
-    assert d["totals"]["runs"] == len(recs["runs"])
 
 
 # ---------------------------------------------------------------------------

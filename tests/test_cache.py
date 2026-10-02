@@ -102,76 +102,76 @@ def test_space_key_scopes_the_directory(fake_blt, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# space_key on a tunnel: the ping() memoization (perf fix)
+# space_key on the v3 bridge: the describe() memoization (perf fix)
 # ---------------------------------------------------------------------------
 
 
-def _install_fake_tunnel(monkeypatch, ping):
-    """Point the cache's locator at a fake tunnel module whose ``ping`` is ``ping``.
+def _install_fake_tunnel(monkeypatch, describe):
+    """Point the cache's locator at a fake v3 bridge whose ``describe_info`` is given.
 
-    ``space_key`` resolves tunnel-ness via ``_blt.is_tunnel()`` (which ignores the
-    ``blt`` argument), so both ``get_blt`` and ``is_tunnel`` must be steered.
+    ``space_key`` resolves tunnel-ness via ``_blt.is_tunnel()`` and the root id via
+    ``_blt.describe_info()`` (both ignore the ``blt`` argument), so all three seams
+    are steered.
     """
-    module = types.SimpleNamespace(
-        __balthazar_tunnel__=True, tunnel_state={}, ping=ping
-    )
+    module = types.SimpleNamespace(__balthazar_tunnel__=3)
     monkeypatch.setattr(cache._blt, "get_blt", lambda: module)
     monkeypatch.setattr(cache._blt, "is_tunnel", lambda: True)
+    monkeypatch.setattr(cache._blt, "describe_info", describe)
     return module
 
 
-def test_space_key_memoizes_ping_across_lookups(monkeypatch):
-    cache._PING_CACHE.clear()
+def test_space_key_memoizes_describe_across_lookups(monkeypatch):
+    cache._ROOT_CACHE.clear()
     counter = {"n": 0}
 
-    def ping():
+    def describe():
         counter["n"] += 1
-        return {"flow_id": "root-123"}
+        return {"flow_run": "root-123"}
 
-    _install_fake_tunnel(monkeypatch, ping)
-    monkeypatch.setenv("BALTHAZAR_SESSION_TUNNEL_URL", "https://tunnel.example/one")
+    _install_fake_tunnel(monkeypatch, describe)
+    monkeypatch.setenv("BALTHAZAR_BRIDGE_URL", "https://tunnel.example/one")
 
     keys = {cache.space_key() for _ in range(3)}
     assert len(keys) == 1  # stable
     assert next(iter(keys)).startswith("tunnel-")
-    assert counter["n"] == 1  # three lookups, a single ping
+    assert counter["n"] == 1  # three lookups, a single describe
 
 
-def test_space_key_repings_when_tunnel_url_changes(monkeypatch):
-    cache._PING_CACHE.clear()
+def test_space_key_requeries_when_bridge_url_changes(monkeypatch):
+    cache._ROOT_CACHE.clear()
     counter = {"n": 0}
 
-    def ping():
+    def describe():
         counter["n"] += 1
-        return {"flow_id": "root-123"}
+        return {"flow_run": "root-123"}
 
-    _install_fake_tunnel(monkeypatch, ping)
+    _install_fake_tunnel(monkeypatch, describe)
 
-    monkeypatch.setenv("BALTHAZAR_SESSION_TUNNEL_URL", "https://tunnel.example/one")
+    monkeypatch.setenv("BALTHAZAR_BRIDGE_URL", "https://tunnel.example/one")
     first = cache.space_key()
-    monkeypatch.setenv("BALTHAZAR_SESSION_TUNNEL_URL", "https://tunnel.example/two")
+    monkeypatch.setenv("BALTHAZAR_BRIDGE_URL", "https://tunnel.example/two")
     second = cache.space_key()
 
-    assert first != second  # switching tunnels changes the namespace
-    assert counter["n"] == 2  # and re-pings for the new URL
+    assert first != second  # switching bridges changes the namespace
+    assert counter["n"] == 2  # and re-queries describe for the new URL
 
 
-def test_space_key_does_not_memoize_a_failed_ping(monkeypatch):
-    cache._PING_CACHE.clear()
+def test_space_key_does_not_memoize_a_failed_describe(monkeypatch):
+    cache._ROOT_CACHE.clear()
     state = {"fail": True, "n": 0}
 
-    def ping():
+    def describe():
         state["n"] += 1
         if state["fail"]:
-            raise RuntimeError("tunnel offline")
-        return {"flow_id": "root-xyz"}
+            raise RuntimeError("bridge offline")
+        return {"flow_run": "root-xyz"}
 
-    _install_fake_tunnel(monkeypatch, ping)
-    monkeypatch.setenv("BALTHAZAR_SESSION_TUNNEL_URL", "https://tunnel.example/x")
+    _install_fake_tunnel(monkeypatch, describe)
+    monkeypatch.setenv("BALTHAZAR_BRIDGE_URL", "https://tunnel.example/x")
 
-    cache.space_key()  # ping raises -> url-only key, nothing memoized
+    cache.space_key()  # describe raises -> url-only key, nothing memoized
     state["fail"] = False
-    cache.space_key()  # recovers -> pings again rather than reusing the failure
+    cache.space_key()  # recovers -> queries again rather than reusing the failure
     assert state["n"] == 2
 
 

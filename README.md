@@ -1,323 +1,161 @@
 # pythontunnel
 
-Debug local Python against live Balthazar data. A flow running on the Runner hosts a
-loopback JSON-RPC server; a local drop-in `balthazar` module forwards `blt.*` calls to
-it, so a script in VS Code — breakpoints and all — reads real devices and writes real
-flow runs.
+Debug local Python against live Balthazar data. A flow running on the Runner serves the
+whole `balthazar` API over the Balthazar app tunnel; a local drop-in `balthazar` module
+reflects `blt.*` calls to it, so a script in your editor — breakpoints and all — reads real
+devices and writes real flow runs, behind your Balthazar login, from any laptop.
 
-Two generations live here:
-
-| | v1 — one-shot | v2 — session |
-|---|---|---|
-| Flow | `flows/tunnel_server.py` | `flows/tunnel_session_server.py` |
-| Client | `balthazar.py` | `session_tunnel/balthazar.py` |
-| Model | each call self-contained; a run is assembled client-side and posted in one shot | flow-run **contexts stay open** across calls |
-| `enter_new_flow_run` | not supported | yes, nested |
-| Plots | `new_flow_run(..., figures=fig)` | `plt.show()` inside a context |
-| Device writes | no | `device.params.update({...})` |
-| Port | 8765 | 8766 |
-
-v1 is the smaller, safer thing: no shared server state, so no ownership or recovery
-concerns. v2 is what you want for code that should read like a real flow. They can run
-side by side on different ports. **[Jump to v2 →](#v2--session-tunnel)**
-
-## The three pieces (v1)
-
-| File | Runs where | Role |
-|---|---|---|
-| `flows/tunnel_server.py` | On the Runner, as a Balthazar flow | Hosts the RPC server, translates requests into real `blt.*` calls |
-| `balthazar.py` | Your machine | Drop-in stand-in for the injected module; forwards over HTTP |
-| `demo.ipynb` | Your machine | Notebook demo — one example per cell, inline plots and printed results |
-| `demo.py` | Your machine | Same examples as a plain script, for headless runs and CI |
-
-## Run it
-
-1. Register `flows/tunnel_server.py` as a flow in your space and start it. Leave it
-   running — it writes credentials to `~/.balthazar_tunnel.json` (mode 0600).
-   Optional flow parameter: `port` (default `8765`).
-2. Open `demo.ipynb` from this directory and run the cells, or run `python demo.py`. Set a
-   breakpoint anywhere — the calls execute on the Runner, the code executes locally.
-
-Open the notebook with this directory as the working directory, so `import balthazar`
-resolves to the shim. In VS Code and JupyterLab that is the default for a notebook stored
-here.
-
-### One notebook gotcha
-
-The inline backend closes figures at the end of each cell
-(`InlineBackend.close_figures` defaults to `True`), so `figures="all"` only sees figures
-created in the *current* cell — a figure from an earlier cell is already gone. Build the
-set you want to ship together in one cell, or pass the figures explicitly. In a plain
-script this doesn't arise.
-
-Ordering works out on its own: the inline backend renders at the *end* of the cell, which
-is after `new_flow_run` has already shipped the figure, so one `fig` both uploads and
-displays.
-
-The shim is stdlib-only and needs no install — `balthazar.py` is picked up from the
-working directory. To use it from elsewhere, put this directory on `PYTHONPATH`. Sending
-plots additionally needs `matplotlib` locally (imported lazily, so reads and plain runs
-work without it); `demo.py` also uses `numpy`.
-
-## Attaching plots to a flow run
-
-```python
-fig, ax = plt.subplots()
-ax.plot(bias, current)
-
-blt.new_flow_run("I–V sweep", devices=[device], figures=fig)   # or figures="all"
-```
-
-`figures` takes a Figure, a list of them, or `"all"` for every open figure (which is
-what `plt.show()` would sweep up). They are rendered to SVG locally and stored against
-the new run.
-
-## Inputs and outputs on a run
-
-```python
-blt.new_flow_run(
-    "I-V sweep",
-    devices=[device],
-    parameters={"bias_min_v": -1.0, "bias_max_v": 1.0, "points": 201},   # inputs
-    output={"i_at_1v_ma": 0.87, "status": "success"},                     # outputs
-    figures=fig,
-)
-```
-
-`parameters` are the run's inputs and must be **flat scalars** — they go through the
-platform's parameter type inference, and a `None` has no inferable type. `output` takes
-**primitives only**: str / int / float / bool / small list. No dicts, no dates, no
-DataFrames.
-
-The tunnel flow reports its own outputs too — `tunnel_url`, `port`, `status`, and live
-counters for requests served, flow runs created, plots stored and errors.
-
-## Run status
-
-A run is `FINISHED` unless you pass `status="FAILED"`. That is enforced rather than
-incidental: the Runner's context `__exit__` reports FAILED for **any** exception in
-flight inside the run's context, so an unguarded failure while storing a plot or writing
-output would turn the whole run red with no explanation beyond the exception string. Each
-step inside the context therefore catches its own errors, which are
-
-- logged into the run via `blt.error`,
-- returned to the client in `problems`,
-- printed locally as `tunnel warning: …`.
-
-Two things make this work, both found by reading the Runner source:
-
-- Plots are stored via `blt.api.store_visualizations([(id, filename, svg_bytes)])` — the
-  same call the Runner's own matplotlib backend makes on `plt.show()`. It attaches to
-  whichever flow run is *current* and returns no IDs, so a plot cannot be linked to a
-  run after the fact.
-- Therefore the new run must be **entered** before storing, via `enter_new_flow_run`,
-  which the Runner restricts to the main thread. Hence the job queue: HTTP handlers run
-  on worker threads and hand work to the main thread, which is the only caller of
-  `blt.*`. Every operation is executed serially.
-
-Sending rendered SVG rather than a pickled figure is deliberate — the payload stays
-independent of the matplotlib version on the Runner.
-
-Without `figures`, `new_flow_run` takes the simpler path (`blt.new_flow_run`, a
-completed history entry). Same visible result, different call underneath.
-
-## Why naming the shim `balthazar` is safe
-
-The Runner registers its module with `pyo3::append_to_inittab!`, which makes it a
-**builtin**. CPython consults `BuiltinImporter` before `PathFinder` in `sys.meta_path`,
-so on the Runner the real module always wins — even if this file sits in the cwd or the
-venv. Locally, where no builtin exists, this file is found instead. That means
-`import balthazar as blt` is identical in both places: no `try/except` shim import, and
-code you debug locally is code you can deploy unchanged.
-
-`flows/tunnel_server.py` still asserts it got the real module (via a
-`__balthazar_tunnel__` marker), so a misconfigured path fails loudly instead of making
-the tunnel call itself.
-
-## Scope (v1)
-
-Operations: `ping`, `search_devices`, `get_device_params`, `new_flow_run`,
-`create_flow_run` (the plot-bearing path), `log`. Device-param writes, open contexts and
-a context-aware `plt.show()` are v2's job. `blt.secrets` is exposed by neither.
-
----
-
-# v2 — session tunnel
+The transport is the **v3 reflection bridge**. Earlier one-shot (v1) and session (v2)
+tunnels have been removed; v3 is the only path.
 
 ```
-flows/tunnel_session_server.py   the flow (port 8766, idle_timeout 1800s)
-session_tunnel/
-├── balthazar.py                 the v2 client
-├── demo_sessions.py             script demo
-└── demo_sessions.ipynb          notebook demo
+flows/tunnel_bridge.py           the v3 server flow (stdlib-only)
+bridge/
+├── balthazar.py                 the drop-in: `import balthazar as blt` connects from the profile
+└── balthazar_remote.py          the v3 client (Remote), extended from the remoteblt4/ prototype
 ```
 
-Start the flow, then run the demos **from `session_tunnel/`** so `import balthazar`
-resolves to the v2 shim rather than the v1 one a level up:
+The bridge **reflects** attribute access, calls, item access and context-manager use onto
+the real module on the Runner. There is no main-thread job queue and no single-owner lock;
+every call just runs `blt.*` from a worker thread. The one transport is the **Balthazar app
+tunnel**. The full interface is in [`docs/v3/SPEC.md`](docs/v3/SPEC.md).
+
+## Connect
 
 ```bash
-cd session_tunnel && python demo_sessions.py
-```
-
-```python
-with blt.enter_new_flow_run(name="I-V sweep", devices=[device],
-                            parameters={"bias_max_v": 1.0}):
-    plt.plot(bias, current)
-    plt.show()                                   # figure lands on THIS run
-    blt.output["r_zero_ohm"] = 12.3              # output lands on THIS run
-    device.params.update({"measurements": ...})  # attributed to THIS run
-```
-
-Inside the block, `blt.params`, `blt.devices`, `blt.flow_run`, `blt.parent()` and
-`blt.parents()` all reflect the open run — implemented with a module-level
-`__getattr__` (PEP 562), since a plain assignment could not track the innermost
-context. Contexts nest and must close LIFO. An exception marks the run FAILED and
-re-raises; `run.fail("why")` does it without an exception.
-
-### What makes v2 harder
-
-- **A context spans many requests**, and the Runner's context is process-global
-  (`blt.params`, `blt.output`, `blt.devices`, `blt.flow_run` are module attributes). Two
-  clients interleaving would silently write into each other's runs, so while a stack is
-  open only the owning client may act.
-- **A client that dies mid-block** leaves a run stuck in `RUNNING`. Three backstops: the
-  shim closes contexts on interpreter exit, the server's idle watchdog unwinds abandoned
-  contexts after `idle_timeout`, and `blt.reset_contexts()` forces it. The watchdog
-  default is deliberately generous (30 min) because a breakpoint inside a `with` block
-  stops the client from sending anything — and with VS Code's debugger suspending all
-  threads, even the heartbeat stops.
-- **Marking a child FAILED** needs an exception in flight at exit, since the Runner
-  derives status from `exc_value`. The server calls `__exit__` directly with a
-  synthesized exception rather than raising, so the recorded message is the client's.
-
-### `plt.show()` capture
-
-The shim wraps `plt.show` while a context is open — uploading every open figure whose
-SVG hash it has not already sent, then delegating to the real `show`. Wrapping rather
-than replacing the backend keeps inline rendering working in notebooks; the Runner uses a
-real backend (`MPLBACKEND=module://balthazar.matplotlib.backend`), which would displace
-the inline backend and cost you local plots.
-
-### Device-param writes
-
-`update()` is the only write path. Subscript assignment **raises**, because on the real
-proxy it does not reliably sync (notably for dict values) — the real failure is silent,
-which is worse to develop against. `pop(key, default)` raises `KeyError` to match the
-real proxy, which ignores the default. `del params[key]` works, since removal is the one
-thing `update` cannot express.
-
-### Device cache (large spaces)
-
-A space with 250k+ devices is slow to page on every call, and the data changes rarely.
-Set the `device_indexes` flow parameter and the server loads every device once (full
-records, in memory) and keeps a `str(value) → [device ids]` map per index:
-
-```jsonc
-// device_indexes (a JSON string); the value may also be
-// {"path": "hierarchy.wafer", "device_type": "Die"} to restrict one type.
-{"wafer": "hierarchy.wafer"}
-```
-
-Then, from your local code:
-
-```python
-blt.cached_devices("wafer", "W123")      # or the generated accessor:
-blt.get_wafer_devices("W123")            # tunnel-only; not on a real Runner
-blt.device_cache_status()                # {state, count, built_at, indexes, …}
-blt.refresh_device_cache(wait=True)      # full reload (atomic; keeps old on failure)
-blt.tunnel_cached_devices_query(device_type="Die", keys=["lot"])  # whole-space, paged
-```
-
-The load is orchestrated like `space_schema` (many small main-thread jobs off a worker
-thread), so other clients' ops interleave; concurrent callers wait for the one load.
-`space_schema` builds from the cache when it is ready, and an `update_device_params`
-write updates the cache write-through. `cached_devices(..., refresh=True)` re-fetches one
-value's known ids (picking up changes, dropping vanished devices) but cannot discover
-*new* devices — that needs `refresh_device_cache`.
-
-Related flow parameters: `warm_device_cache` (default on when any index is configured)
-loads in the background at start; `device_cache_dir` (default `~/.balthazar_tunnel_cache`)
-is where the cache is persisted on the Runner — `<dir>/<space-or-root-flow key>/devices.pkl`
-plus a JSON meta sidecar, written atomically (dir `0700`, files `0600`, since it holds
-space data) — so a restart does not reload 250k devices. A whole-space
-`tunnel_cached_devices_query` can produce a response far larger than the request cap, so
-the server pages it (`offset`/`limit`) and the shim stitches the pages back together.
-
-### Demo configuration
-
-Both v2 demos start with `DEVICE_TYPE`, `DEVICE_NAME` and `MAX_BATCH_DEVICES`. The last
-one matters: the nested example opens one child run per device, so on a space with 65
-devices an uncapped loop would create 65 runs.
-
-## Remote access — the Balthazar app tunnel
-
-Everything above assumes your local code runs on the **same host** as the Runner, reaching
-the loopback server over `127.0.0.1`. You can also drive the v2 tunnel from a **remote
-laptop** through the platform's app tunnel (`blt.serve_app`), behind your Balthazar login.
-The client API, `blt_analytics` and the MCP tools are identical — only the transport
-changes.
-
-```bash
-# 1. Start flows/tunnel_session_server.py with the flow parameter app_tunnel = true.
-#    Optional: allowed_users = "alice-id,bob-id" (default: the starting user only;
-#    "*" lets any logged-in user through).
+# 1. Start flows/tunnel_bridge.py in your space.
+#    Optional flow params: shared=true (+ allowed_users="alice-id,bob-id"),
+#    device_indexes='{"wafer": "hierarchy.wafer"}', expose_secrets=false, …
 # 2. In Balthazar, click "Open app" on the running flow — the page shows the snippet.
 # 3. Copy the URL and connect (device-code login by default):
 blt-tunnel connect "https://<host>/app-tunnel/<runner>/<flow>/?space_id=…"
-# 4. Verify and use blt / blt_analytics / MCP exactly as on loopback:
+#    …which prints the owner, your caller id, whether the bridge is shared, and the flow run.
+# 4. Verify, then use blt / blt_analytics / the MCP tools:
 blt-tunnel doctor
 ```
 
-- **Login** defaults to a device code (`--login device`: confirm a code in a browser, no
-  password). Also `--login browser` (PKCE) and `--login password` (prompted, or
-  `--password-stdin`) — a password is **never** a command-line argument. `--site` /
-  `--ca-file` handle a non-discoverable site or a custom CA.
-- The **refresh token is cached** at `~/.config/balthazar/remote.json` (0600); the saved
-  profile `~/.balthazar_session_tunnel.json` (`{"transport": "app", …}`) holds **no** token.
-  `blt-tunnel disconnect [--forget]` removes the profile (and, with `--forget`, the token).
-  `BALTHAZAR_SESSION_TUNNEL_APP_URL` overrides the profile.
-- **Owner-only by default**; **one app per (runner, flow)**, which dies when the run ends.
-- Each request is capped at **60 s**, so long operations (first device-cache load,
-  `space_schema`) are **polled** transparently by the shim.
-- A stdio **MCP server can't log in interactively**: with no cached token the schema tools
-  return a clear error asking you to `blt-tunnel connect` in a terminal first. `blt-tunnel
-  doctor` reports the transport and, on the app transport, never triggers a login.
+Or connect directly in Python, without the CLI:
 
-The login client and the server-side access guards are ported from the `remoteblt/`
-developer prototype.
+```python
+import balthazar_remote
+remote = balthazar_remote.connect("https://<host>/app-tunnel/<runner>/<flow>/?space_id=…")
+# or, after `blt-tunnel connect` once:  remote = balthazar_remote.connect_from_profile()
+```
 
-## Security (both)
+`blt-tunnel connect` writes `~/.balthazar_bridge.json` (0600, **no tokens** — those stay in
+the `~/.config/balthazar/remote.json` cache). `blt_analytics._blt.get_blt()` then loads
+`bridge/balthazar.py` automatically, so `devices_df`, `runs_df`, `overview`, the
+`blt-schema` CLI and the MCP tools all run over v3 with no code change. `$BALTHAZAR_BRIDGE_URL`
+overrides the profile's URL; `blt-tunnel disconnect [--forget]` removes the profile (and,
+with `--forget`, the cached token).
 
-Binds `127.0.0.1` only, per-session bearer token, non-loopback `Host` headers rejected,
-and dispatch only through an explicit operation allowlist. Anything that can read the
-connection file gets full read access to the space and can create flow runs, so treat
-the token as a credential. `blt.secrets` is deliberately not tunnelled — v2 raises
-`NotImplementedError` on it rather than forwarding.
+## Client parameters (`balthazar_remote.connect`)
+
+`connect(app_url, *, site=None, login="device", username=None, password=None, ca_file=None, interactive=True)`
+
+| param | meaning |
+|---|---|
+| `app_url` | the app-tunnel URL copied from the opened flow |
+| `login` | `device` (default — confirm a code in a browser), `browser` (PKCE), or `password` |
+| `username` / `password` | password login only; a password is never a CLI argument |
+| `site` / `ca_file` | a non-discoverable Balthazar site, or a custom CA bundle (PEM) |
+| `interactive` | `False` raises `LoginRequired` instead of prompting; `$BALTHAZAR_TUNNEL_NONINTERACTIVE=1` forces it (the MCP server sets this) |
+
+## Run contexts, plots, outputs, device writes
+
+Local code reads like a real flow — open a run, and output, plots and device writes inside
+the block attribute to it:
+
+```python
+import matplotlib.pyplot as plt
+import balthazar as blt
+
+device = blt.search_devices(type="Wafer", limit=1)[0]
+
+with blt.enter_new_flow_run(name="IV sweep", devices=[device],
+                            parameters={"bias_max_v": 1.0}):
+    plt.plot(bias, current)
+    plt.show()                                     # figure lands on THIS run
+    blt.output["r_zero_ohm"] = 12.3                # output lands on THIS run
+    device.params.update({"measurements": {...}})  # device write attributed to THIS run
+```
+
+`blt.output` takes **primitives only** (str / int / float / bool / small list). An
+exception leaving the block marks the run FAILED and re-raises.
+
+## Flow parameters (`flows/tunnel_bridge.py`)
+
+`shared` (default `false` — owner + `allowed_users` only), `allowed_users`, `idle_timeout`
+(`900` s), `call_timeout` (`45` s), `max_refs` (`50000` per caller), `expose_secrets`
+(`false`), `device_indexes`, `warm_device_cache`, `device_cache_dir`, and `part_bytes`.
+
+## Limits (documented; not faked)
+
+- **Long calls are polled.** A call that exceeds `call_timeout` becomes a `pending` job the
+  client polls transparently (with a one-line notice); `blt_analytics` schema acquisition
+  polls `blt.tunnel.space_schema()` until it is `ready`.
+- **Large payloads.** Anything over the app-tunnel's ~5 MB cap is sent as **zlib-compressed
+  2 MiB parts** in both directions; the part size is the `part_bytes` flow parameter.
+  Transparent to your code.
+- **Sibling-only nesting.** Runner 1.35.1 can only create contexts as children of the bridge
+  run, so `enter_new_flow_run` blocks nested inside one another become **siblings**, and
+  `parent()` is always the bridge run.
+- **Heartbeat vs. debugger pauses.** A daemon thread sends a heartbeat every 30 s; if the
+  client goes silent for `idle_timeout` the server closes its open contexts. A debugger pause
+  freezes that thread — a known limitation (a detached heartbeat sidecar is a later
+  improvement).
+- **Shared mode runs as the owner.** With `shared=true`, every allowed caller's work is
+  attributed to the flow's owner (`blt.user`), and an audit line is written per call.
+- **Secrets hidden by default.** `blt.secrets` (and `serve_app`, `prompt_input`,
+  `enter_new_flow_run`, `context`) are not reachable through the bridge unless the flow sets
+  `expose_secrets=true`.
+
+## tunnel namespace
+
+On v3 the device-cache and schema helpers live under `blt.tunnel`:
+`blt.tunnel.cached_devices(index, value)`, `blt.tunnel.cached_devices_query(device_type=…,
+keys=[…])`, `blt.tunnel.device_cache_status()`, `blt.tunnel.refresh_device_cache()`, and
+`blt.tunnel.space_schema()`. `blt.get_<index>_devices(value)` is generated from the flow's
+`device_indexes`. `blt_analytics` uses these automatically.
+
+## Security
+
+The bridge is served over the Balthazar app tunnel, behind your login: every call carries
+`X-BLT-User-Id`; browser POSTs (`Origin` / `Sec-Fetch-Site` present) are rejected; by default
+only the owner (`blt.user`, case-insensitive) and `allowed_users` may connect, and
+`shared=true` opens it to every caller the platform lets through, with a per-call audit line.
+The login client and the server-side access guards are ported from the developer prototype.
+
+## Why naming the drop-in `balthazar` is safe
+
+The Runner registers its module with `pyo3::append_to_inittab!`, which makes it a
+**builtin**. CPython consults `BuiltinImporter` before `PathFinder`, so on the Runner the
+real module always wins. Locally, where no builtin exists, `bridge/balthazar.py` is found
+instead. The same `import balthazar as blt` works in both places — no `try/except` import,
+and code you debug locally is code you deploy unchanged.
 
 ---
 
 # Analytics with your AI agent
 
-A coding agent (Claude Code, Cursor, Copilot) can answer data questions about your
-Balthazar space: it learns the space's **structure** from schema tools, then writes Python
-that pulls the **real data** through the v2 session tunnel and plots it. This builds on the
-v2 tunnel above; v1 is untouched.
+A coding agent (Claude Code, Cursor, Copilot) can answer data questions about your Balthazar
+space: it learns the space's **structure** from schema tools, then writes Python that pulls
+the **real data** through the bridge and plots it.
 
 ## Install and set up
 
 ```bash
 uv pip install -e ".[all]"     # package `blt_analytics` + CLI + MCP server
 blt-tunnel setup               # register the MCP server, copy the skills, update AGENTS.md
-# connect from a remote laptop (skip on the Runner host, where loopback is automatic):
-blt-tunnel connect "<app url>" # start the flow with app_tunnel=true, "Open app", copy the URL
-blt-tunnel doctor              # transport, connection, ping, schema, pandas, mcp
+blt-tunnel connect "<app url>" # start flows/tunnel_bridge.py, "Open app", copy the URL
+blt-tunnel doctor              # bridge, connection, describe, schema, pandas, mcp
 ```
 
 `blt-tunnel setup` is idempotent and prints what it changed: it writes the `balthazar-schema`
 MCP server entry into `.mcp.json` / `.cursor/mcp.json` / `.vscode/mcp.json`, copies the
 `skills/*` into `.claude/skills/` and `.agents/skills/` (add `--global` for the user-level
-dirs), and maintains a block in `AGENTS.md`. The tunnel flow
-(`flows/tunnel_session_server.py`) must be running in the space first (see the v2 section).
+dirs), and maintains a block in `AGENTS.md`. The bridge flow (`flows/tunnel_bridge.py`) must
+be running in the space first.
 
 ## Three layers, three jobs
 
@@ -325,25 +163,25 @@ dirs), and maintains a block in `AGENTS.md`. The tunnel flow
 |---|---|---|
 | **Tools** | `balthazar-schema` MCP server (or the `blt-schema` CLI) | Tell the agent **what exists** — device types, params, flows, runs, inputs/outputs, with dtypes, shapes and coverage. **Schema only, never values.** |
 | **Skills** | `balthazar-tunnel`, `balthazar-analytics` | Tell the agent **how to work** — the setup, the schema-first workflow, the gotchas. |
-| **`blt` / `blt_analytics`** | the shim + the pandas layer | Fetch the **actual data** into the user's process (`devices_df`, `runs_df`, …) and plot it. |
+| **`blt` / `blt_analytics`** | the drop-in + the pandas layer | Fetch the **actual data** into the user's process (`devices_df`, `runs_df`, …) and plot it. |
 
-The split is the point: the agent reads *schema* to decide what to pull, then pulls and
-plots the *values* locally. Figures attach to a Balthazar run with `publish(...)` only when
-you ask to save or share. See `skills/balthazar-analytics/` for the full workflow and
-worked examples.
+The split is the point: the agent reads *schema* to decide what to pull, then pulls and plots
+the *values* locally. Figures attach to a Balthazar run with `publish(...)` only when you ask
+to save or share. See `skills/balthazar-analytics/` for the full workflow and worked examples.
 
 ## Large spaces: the server-side device cache
 
-On a space with hundreds of thousands of devices, paging every `search_devices` call is
-slow. The tunnel flow can keep a **server-side device cache** — all device records by id,
-plus a lookup table per configured *index*. Configure it with the flow parameters
-`device_indexes` (e.g. `{"wafer": "hierarchy.wafer"}`), `warm_device_cache` and
-`device_cache_dir`.
+On a space with hundreds of thousands of devices, paging every `search_devices` call is slow.
+The bridge flow can keep a **server-side device cache** — all device records by id, plus a
+lookup table per configured *index*. Configure it with the flow parameters `device_indexes`
+(e.g. `{"wafer": "hierarchy.wafer"}`), `warm_device_cache` and `device_cache_dir`.
 
 - `blt_analytics.devices_df(...)` uses the cache automatically when it is ready (no API
-  change), and `devices_df(index="wafer", value="W123")` pulls one index value straight
-  from it. `overview()` lists the configured indexes under `device_indexes`.
-- Directly on the shim: `blt.get_wafer_devices("W123")` / `blt.cached_devices(...)`,
-  `blt.device_cache_status()`, and `blt.refresh_device_cache()` to reload after new devices
-  land. These accessors are **tunnel-only** (not on the real Runner); the first load can
-  take minutes. See `skills/balthazar-tunnel/` and `skills/balthazar-analytics/`.
+  change), and `devices_df(index="wafer", value="W123")` pulls one index value straight from
+  it. `overview()` lists the configured indexes under `device_indexes`.
+- Directly on the bridge, these live under `blt.tunnel`:
+  `blt.tunnel.cached_devices("wafer", "W123")`, `blt.tunnel.device_cache_status()`,
+  `blt.tunnel.refresh_device_cache()`, `blt.tunnel.cached_devices_query(...)` — plus the
+  generated `blt.get_wafer_devices("W123")`. They are **tunnel-only** (not on the real
+  Runner), and the first load can take minutes. See `skills/balthazar-tunnel/` and
+  `skills/balthazar-analytics/`.

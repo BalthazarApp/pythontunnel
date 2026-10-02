@@ -7,12 +7,11 @@ the recommended order (``overview`` first, then narrow). Every tool returns a
 JSON-serializable dict.
 
 Each tool runs through :func:`_guard`, which (a) refuses up front, with an
-actionable message, when the tunnel can't serve a request without an interactive
-login — the app transport with no cached token, which a stdio server cannot prompt
+actionable message, when the v3 bridge can't serve a request without an interactive
+login — a configured bridge with no cached token, which a stdio server cannot prompt
 for; "run ``blt-tunnel connect`` in a terminal" — and (b) converts any error the
 schema call raises into an ``{"error": …}`` dict, so a tool never crashes the
-server. The schema tools work the same over the loopback and app transports; only
-this login edge differs (SPEC §7).
+server.
 
 The spec names ``mcp.server.fastmcp.FastMCP``; that lives there in mcp v1 but was
 renamed to ``mcp.server.mcpserver.MCPServer`` in mcp v2. Both expose the same
@@ -29,6 +28,19 @@ from typing import Any, List, Optional
 
 from blt_analytics import schema
 
+# A stdio MCP server has no console, so the v3 bridge must never fall back to an
+# interactive device-code / browser login (it would block forever on a prompt no
+# one can answer). Forcing non-interactive mode here — before any schema call can
+# trigger the drop-in's lazy connect — turns a missing/expired token into a clean
+# ``LoginRequired`` that :func:`_guard` converts to an actionable tool error
+# (SPEC "blt_analytics integration": "the MCP server sets
+# BALTHAZAR_TUNNEL_NONINTERACTIVE=1 before connecting").
+os.environ["BALTHAZAR_TUNNEL_NONINTERACTIVE"] = "1"
+
+_CONNECT_HINT = (
+    "Run `blt-tunnel connect \"<app url>\"` in a terminal first, then retry."
+)
+
 
 def _has_cached_token() -> bool:
     """Whether the app-tunnel refresh-token cache holds an entry (no login attempted)."""
@@ -40,42 +52,45 @@ def _has_cached_token() -> bool:
     return isinstance(data, dict) and bool(data)
 
 
+def _v3_ready() -> bool:
+    """Whether the v3 bridge can connect non-interactively: profile + cached token."""
+    have_profile = bool(os.environ.get("BALTHAZAR_BRIDGE_URL")) or os.path.exists(
+        os.path.expanduser("~/.balthazar_bridge.json")
+    )
+    return have_profile and _has_cached_token()
+
+
+def _is_login_required(exc: BaseException) -> bool:
+    """Whether ``exc`` is a bridge ``LoginRequired`` (matched by class name, no import)."""
+    return any(cls.__name__ == "LoginRequired" for cls in type(exc).__mro__)
+
+
 def _tunnel_unavailable() -> Optional[dict]:
-    """A clear, actionable error dict when the tunnel can't serve non-interactively.
+    """A clear, actionable error dict when the v3 bridge can't serve non-interactively.
 
     An MCP server runs over stdio and cannot host the device-code / browser login the
-    app transport falls back to when it has no usable token — the shim would block on a
-    prompt no one can answer. So on the app transport with no cached token (or with no
-    connection at all), return an error telling the user to run ``blt-tunnel connect`` in
-    a terminal instead. Best-effort and never raises; an injected digest (tests) or a
-    real Runner / loopback tunnel short-circuits to ``None`` (nothing to guard).
+    bridge falls back to when it has no usable token — the drop-in would block on a
+    prompt no one can answer. So when a v3 bridge is configured but has no cached
+    token, return an error telling the user to run ``blt-tunnel connect`` in a
+    terminal instead. Best-effort and never raises; an injected digest (tests) or a
+    real Runner (no bridge configured) short-circuits to ``None`` (nothing to guard).
     """
     if getattr(schema, "_injected", None) is not None:
         return None
-    try:
-        from blt_analytics import _blt
 
-        module = _blt.get_blt()
+    from blt_analytics import _blt
+
+    try:
+        version = _blt.bridge_version()
     except Exception:  # noqa: BLE001 - let the schema call's own handling surface this
         return None
-    transport_fn = getattr(module, "tunnel_transport", None)
-    if transport_fn is None:
-        return None  # real Runner / old shim: no app-tunnel login to worry about
-    try:
-        transport = transport_fn()
-    except Exception:  # noqa: BLE001
-        return None
-    if transport == "none":
+
+    if version == 3 and not _v3_ready():
+        # v3: a saved profile + a cached token are required up front (reading the
+        # marker/profile never triggers a connect, so this stays non-interactive).
         return {
-            "error": "the Balthazar tunnel is not connected. Run `blt-tunnel connect "
-            '"<app url>"` in a terminal for a remote app tunnel, or start the '
-            "tunnel flow for a local loopback connection."
-        }
-    if transport == "app" and not _has_cached_token():
-        return {
-            "error": "the app tunnel needs a Balthazar login this MCP server cannot "
-            "perform (no interactive prompt over stdio). Run `blt-tunnel connect "
-            '"<app url>"` in a terminal first, then retry.'
+            "error": "the Balthazar v3 bridge needs a login this MCP server cannot "
+            "perform over stdio (no interactive prompt). " + _CONNECT_HINT
         }
     return None
 
@@ -89,6 +104,12 @@ def _guard(call):
     try:
         return call()
     except Exception as exc:  # noqa: BLE001 - tools return errors, they don't raise
+        if _is_login_required(exc):
+            return {
+                "error": "the Balthazar v3 bridge needs a login this MCP server cannot "
+                "perform over stdio. " + _CONNECT_HINT,
+                "hint": "run blt-tunnel connect",
+            }
         return {"error": f"the balthazar tunnel call failed: {exc}", "hint": "run blt-tunnel doctor"}
 
 

@@ -60,6 +60,15 @@ __all__ = [
     "user",
     "serve_app",
     "serve_app_calls",
+    "FlowRunContext",
+    "new_flow_run_context",
+    "flow_run_contexts",
+    "VisualizationBuilder",
+    "DeviceBuilder",
+    "new_devices",
+    "new_devices_calls",
+    "echo",
+    "noise",
 ]
 
 
@@ -265,6 +274,15 @@ _serve_app_calls: list[int] = []
 # space through the server's device cache without perturbing the fixture counts.
 _synthetic_records: list[dict] | None = None
 
+# v3 bridge support: the run-emulation surface. A real Runner exposes
+# ``new_flow_run_context`` returning a ``FlowRunContext`` bound to a child run, plus
+# ``VisualizationBuilder`` / ``DeviceBuilder`` / ``new_devices``. The v3 server reflects
+# these onto the client; the fakes record what crossed so tests can assert attribution
+# and how a context was exited (the watchdog path).
+_flow_run_contexts: list[FlowRunContext] = []
+_new_devices_calls: list[list] = []
+_ctx_counter = iter(range(1, 1_000_000))
+
 
 def set_synthetic_devices(records: list[dict] | None) -> None:
     """Serve ``records`` from ``search_devices`` instead of the fixture (None resets).
@@ -285,6 +303,8 @@ def reset_faults() -> None:
     _history_calls.clear()
     _synthetic_records = None
     _serve_app_calls.clear()
+    _flow_run_contexts.clear()
+    _new_devices_calls.clear()
     user = None
 
 
@@ -467,6 +487,20 @@ def search_flow_run_history(
     return page
 
 
+def echo(value: Any) -> Any:
+    """Return ``value`` unchanged — exercises the parts protocol in both directions
+    (a large argument is split on upload, a large result on download)."""
+    return value
+
+
+def noise(nbytes: int) -> bytes:
+    """Return ``nbytes`` of incompressible random bytes, so a large result forces a
+    genuine multi-part (zlib-resistant) download through the bridge."""
+    import os as _os
+
+    return _os.urandom(int(nbytes))
+
+
 def fetch_visualizations(visualization_ids: Any) -> dict[str, Visualization]:
     """Return ``{id: Visualization}`` for known ids (unknown ids are omitted)."""
     wanted = set(_as_list(visualization_ids) or [])
@@ -475,3 +509,182 @@ def fetch_visualizations(visualization_ids: Any) -> dict[str, Visualization]:
         for v in fixture_space.raw_visualizations()
         if v["id"] in wanted
     }
+
+
+# ---------------------------------------------------------------------------
+# Run emulation surface (v3 bridge): contexts, builders, new_devices
+# ---------------------------------------------------------------------------
+
+
+class VisualizationBuilder:
+    """Fake of the Runner's ``VisualizationBuilder`` (a passive spec object)."""
+
+    def __init__(
+        self,
+        filename: Any,
+        data: bytes,
+        type: Any = None,
+        figure_id: Any = None,
+    ) -> None:
+        self.filename = filename
+        self.data = data
+        self.type = type if type is not None else VisualizationDataType.SVG
+        self.figure_id = figure_id
+
+    def __repr__(self) -> str:
+        return f"<VisualizationBuilder {self.filename!r} figure_id={self.figure_id}>"
+
+
+class DeviceBuilder:
+    """Fake of the Runner's ``DeviceBuilder`` (a passive spec object)."""
+
+    def __init__(
+        self,
+        name: str,
+        fabrication_date: Any = None,
+        description: Any = None,
+        image_id: Any = None,
+        tags: Any = (),
+        params: Any = None,
+        type: str = "device",
+    ) -> None:
+        self.name = name
+        self.fabrication_date = fabrication_date
+        self.description = description
+        self.image_id = image_id
+        self.tags = list(tags or [])
+        self.params = dict(params or {})
+        self.type = type
+
+    def __repr__(self) -> str:
+        return f"<DeviceBuilder {self.name!r} type={self.type!r}>"
+
+
+class FlowRunContext:
+    """Fake of the Runner's ``FlowRunContext``.
+
+    Records everything written through it (output, logs, stored visualizations,
+    the search_devices call it served) and, crucially for the watchdog test, *how*
+    it was exited: ``"success"``, ``"interrupt"`` or ``("error", type_name,
+    message)``. ``search_devices`` delegates to the module search so a device write
+    routed through the context still resolves against the fixture space.
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        script_name: str | None = None,
+        flow_id: str | None = None,
+        devices: Any = None,
+        parameters: Any = None,
+        started_time: Any = None,
+        **_ignored: Any,
+    ) -> None:
+        self.name = name
+        self.flow = flow
+        self.session = session
+        self.flow_run = _Ident(f"run-ctx-{next(_ctx_counter)}", name)
+        self.devices: list[Device] = list(devices or [])
+        self.params: dict[str, Any] = dict(parameters or {})
+        self.output: dict[str, Any] = {}
+        self.logs: list[tuple[str, str]] = []
+        self.visualizations: list[Any] = []
+        self.searched: dict | None = None
+        self.entered = False
+        self.exited: Any = None
+
+    def __enter__(self) -> "FlowRunContext":
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        if exc_type is None:
+            self.exited = "success"
+        elif issubclass(exc_type, KeyboardInterrupt):
+            self.exited = "interrupt"
+        else:
+            self.exited = ("error", exc_type.__name__, str(exc_value))
+        return False
+
+    def exit(self) -> None:
+        self.exited = "success"
+
+    def info(self, message: str) -> None:
+        self.logs.append(("info", str(message)))
+
+    def warn(self, message: str) -> None:
+        self.logs.append(("warn", str(message)))
+
+    def error(self, message: str) -> None:
+        self.logs.append(("error", str(message)))
+
+    def debug(self, message: str) -> None:
+        self.logs.append(("debug", str(message)))
+
+    def print(self, message: str) -> None:
+        self.logs.append(("print", str(message)))
+
+    def search_devices(self, **kwargs: Any) -> list[Device]:
+        self.searched = dict(kwargs)
+        return search_devices(**kwargs)
+
+    def new_devices(self, builders: list[DeviceBuilder]) -> list[Device]:
+        return new_devices(builders)
+
+    def store_visualizations(self, visualizations: list[Any]) -> list[Any]:
+        self.visualizations.extend(visualizations)
+        return list(visualizations)
+
+    def store_visualization(self, filename: Any, data: bytes, type: Any = None,
+                            figure_id: Any = None) -> Any:
+        builder = VisualizationBuilder(filename, data, type=type, figure_id=figure_id)
+        self.visualizations.append(builder)
+        return builder
+
+    def __repr__(self) -> str:
+        return f"<FlowRunContext {self.flow_run.id} name={self.name!r}>"
+
+
+def new_flow_run_context(
+    name: str | None = None,
+    script_name: str | None = None,
+    flow_id: str | None = None,
+    devices: Any = None,
+    parameters: Any = None,
+    started_time: Any = None,
+    **kwargs: Any,
+) -> FlowRunContext:
+    """Create and record a fake child-run context (does not modify module names)."""
+    ctx = FlowRunContext(
+        name=name, script_name=script_name, flow_id=flow_id, devices=devices,
+        parameters=parameters, started_time=started_time, **kwargs,
+    )
+    _flow_run_contexts.append(ctx)
+    return ctx
+
+
+def flow_run_contexts() -> list[FlowRunContext]:
+    """Every context created via :func:`new_flow_run_context`, in order."""
+    return list(_flow_run_contexts)
+
+
+def new_devices(devices: list[DeviceBuilder]) -> list[Device]:
+    """Create ``Device`` objects from builders, recording the batch for assertions."""
+    _new_devices_calls.append(list(devices))
+    created = []
+    for n, builder in enumerate(devices):
+        created.append(Device({
+            "id": f"dev-new-{len(_new_devices_calls)}-{n}",
+            "type": getattr(builder, "type", "device"),
+            "name": getattr(builder, "name", ""),
+            "description": getattr(builder, "description", None),
+            "fabrication_date": getattr(builder, "fabrication_date", None),
+            "tags": list(getattr(builder, "tags", []) or []),
+            "params": dict(getattr(builder, "params", {}) or {}),
+        }))
+    return created
+
+
+def new_devices_calls() -> list[list]:
+    """The batches passed to :func:`new_devices`, in order (for assertions)."""
+    return list(_new_devices_calls)

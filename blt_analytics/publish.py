@@ -6,7 +6,7 @@ and returns the new ``flow_run_id``. It leans on the environment's existing
 ``plt.show`` capture rather than uploading anything itself, so the same call works
 both ways:
 
-* on the **v2 tunnel shim**, ``plt.show()`` inside an open context uploads the open
+* on the **v3 bridge**, ``plt.show()`` inside an open context uploads the open
   figures it has not already sent;
 * on a **real Runner**, the Balthazar matplotlib backend captures ``plt.show()``.
 
@@ -101,7 +101,7 @@ def _show_only(plt, figures: list) -> None:
 
 
 def _run_id(blt: Any, cm: Any) -> str:
-    """The new run's id, from the shim's context handle or the rebound module name."""
+    """The new run's id, from the context handle or the rebound module name."""
     rid = getattr(cm, "flow_run_id", None)
     if rid:
         return str(rid)

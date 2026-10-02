@@ -212,7 +212,8 @@ def test_doctor_runs_and_reports_with_runner(fake_blt, tmp_path, capsys):
 def test_doctor_does_not_crash_when_tunnel_down(tmp_path, capsys):
     project = tmp_path / "proj"
     project.mkdir()
-    # No fake_blt installed: get_blt loads the v2 shim by path; ping/space_schema fail.
+    # No fake_blt installed and no bridge profile: get_blt cannot locate a module, so
+    # the module/connection/describe/space_schema checks fail (but doctor never crashes).
     rc = cli.run_doctor(project=str(project), home=_home(tmp_path))
     out = capsys.readouterr().out
     assert rc in (0, 1)

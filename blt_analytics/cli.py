@@ -7,15 +7,15 @@ MCP tool returns). ``--refresh`` rebuilds the digest first.
 ``blt-tunnel setup`` wires a project for the analytics workflow — idempotently
 merging the ``balthazar-schema`` MCP server into the per-agent config files,
 copying the bundled skills, and maintaining a marked block in ``AGENTS.md`` — and
-``blt-tunnel doctor`` prints a pass/fail diagnostic (transport, connection/profile,
-ping, space_schema, pandas, mcp, and the project registrations) and exits non-zero
-if anything is wrong, without ever crashing when the tunnel is down.
+``blt-tunnel doctor`` prints a pass/fail diagnostic (bridge, connection/profile,
+describe, space_schema, pandas, mcp, and the project registrations) and exits
+non-zero if anything is wrong, without ever crashing when the bridge is down.
 
-``blt-tunnel connect`` logs in to a **remote** app tunnel (SPEC §7), pings it, and
-saves the connection profile; ``blt-tunnel disconnect`` removes it. Both drive the
-shim's ``tunnel_connect`` / ``tunnel_disconnect`` / ``tunnel_transport`` functions.
-A password is never taken as a command-line argument — only prompted (``getpass``)
-or read with ``--password-stdin``.
+``blt-tunnel connect`` logs in to the Balthazar app tunnel through the v3 reflection
+bridge (SPEC "blt_analytics integration"), runs ``describe``, and saves the bridge
+profile (``~/.balthazar_bridge.json``); ``blt-tunnel disconnect`` removes it. A
+password is never taken as a command-line argument — only prompted (``getpass``) or
+read with ``--password-stdin``.
 
 The home directory is overridable (``--home`` / ``$BLT_ANALYTICS_HOME``) so tests
 never touch the real one.
@@ -193,19 +193,50 @@ def _resolve_home(home: str | None) -> str:
     return home or os.environ.get("BLT_ANALYTICS_HOME") or os.path.expanduser("~")
 
 
-# The loopback connection file and the remote app-tunnel profile share one path
-# (``~/.balthazar_session_tunnel.json``); the ``transport`` key inside tells them
-# apart (SPEC §7). The refresh-token cache lives separately, under ``~/.config``.
-_CONNECTION_FILE = ".balthazar_session_tunnel.json"
+# The refresh-token cache lives under ``~/.config``; the v3 bridge profile keeps
+# only the connection parameters (``~/.balthazar_bridge.json``), never a token. The
+# profile's presence is how connect / disconnect / doctor know a bridge is in play.
 _TOKEN_CACHE = (".config", "balthazar", "remote.json")
-
-
-def _connection_profile_path(home: str) -> str:
-    return os.path.join(home, _CONNECTION_FILE)
+_BRIDGE_PROFILE_FILE = ".balthazar_bridge.json"
 
 
 def _token_cache_path(home: str) -> str:
     return os.path.join(home, *_TOKEN_CACHE)
+
+
+def _bridge_profile_path(home: str) -> str:
+    return os.path.join(home, _BRIDGE_PROFILE_FILE)
+
+
+def _import_balthazar_remote():
+    """The v3 client module (``balthazar_remote``), or ``None`` if it isn't available.
+
+    Honors an already-imported / test-injected ``balthazar_remote`` first, then loads
+    it from the bridge dir (``$BLT_BRIDGE_DIR`` or ``<repo>/bridge``). ``blt-tunnel
+    connect`` needs it; if it cannot be imported, connect fails with a clear error.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module("balthazar_remote")
+    except Exception:  # noqa: BLE001 - not importable yet; try the bridge dir
+        pass
+    bridge_dir = _blt._bridge_dir()
+    if not os.path.exists(os.path.join(bridge_dir, "balthazar_remote.py")):
+        return None
+    if bridge_dir not in sys.path:
+        sys.path.insert(0, bridge_dir)
+    try:
+        return importlib.import_module("balthazar_remote")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _bridge_version_safe() -> int | None:
+    try:
+        return _blt.bridge_version()
+    except Exception:  # noqa: BLE001 - a diagnostic / connect must never crash here
+        return None
 
 
 def _has_cached_token(home: str) -> bool:
@@ -221,26 +252,6 @@ def _has_cached_token(home: str) -> bool:
     except (OSError, json.JSONDecodeError):
         return False
     return isinstance(data, dict) and bool(data)
-
-
-def _detect_transport() -> str:
-    """Best-effort current tunnel transport, never raising.
-
-    Returns the shim's ``tunnel_transport()`` (``"loopback"``/``"app"``/``"none"``);
-    ``"runner"`` when the located module is the real Runner module (no tunnel), and
-    ``"unknown"`` when a shim is present but too old to report it.
-    """
-    try:
-        module = _blt.get_blt()
-    except Exception:  # noqa: BLE001 - no module/shim reachable at all
-        return "none"
-    fn = getattr(module, "tunnel_transport", None)
-    if fn is None:
-        return "unknown" if getattr(module, "__balthazar_tunnel__", False) else "runner"
-    try:
-        return fn() or "none"
-    except Exception:  # noqa: BLE001 - a diagnostic must never crash
-        return "unknown"
 
 
 def _agents_block() -> str:
@@ -427,76 +438,6 @@ def _check(name: str, fn: Callable[[], tuple[bool, str]]) -> tuple[str, bool, st
     return name, bool(ok), detail
 
 
-def _check_module() -> tuple[bool, str]:
-    from blt_analytics import _blt
-
-    module = _blt.get_blt()
-    kind = "tunnel shim" if _blt.is_tunnel() else "runner module"
-    return True, f"located balthazar ({kind})"
-
-
-_TRANSPORT_LABELS = {
-    "loopback": "loopback (local — same host as the Runner)",
-    "app": "app tunnel (remote — Balthazar login)",
-    "none": "not connected",
-    "runner": "not using the tunnel (real Runner module)",
-    "unknown": "could not determine (shim too old to report it?)",
-}
-
-
-def _check_transport(transport: str) -> tuple[bool, str]:
-    """Report the transport. Informational — the connection check judges 'none'."""
-    return True, _TRANSPORT_LABELS.get(transport, transport)
-
-
-def _check_connection(home: str, transport: str) -> tuple[bool, str]:
-    """Connection/profile presence, by transport.
-
-    The app transport additionally needs a cached login token to work without an
-    interactive prompt; without one it points the user at ``blt-tunnel connect``.
-    """
-    try:
-        module = _blt.get_blt()
-    except Exception:  # noqa: BLE001
-        module = None
-    path = getattr(module, "CONNECTION_FILE", None) or _connection_profile_path(home)
-
-    if transport == "runner":
-        return True, "running on a Runner; no connection file needed"
-
-    if transport == "app":
-        have_profile = os.path.exists(path) or bool(
-            os.environ.get("BALTHAZAR_SESSION_TUNNEL_APP_URL")
-        )
-        if not have_profile:
-            return False, f"no app-tunnel profile at {path} (run: blt-tunnel connect)"
-        if _has_cached_token(home):
-            return True, f"app-tunnel profile present ({path}); cached login token found"
-        return False, "app-tunnel profile present but no cached login token (run: blt-tunnel connect)"
-
-    if os.path.exists(path):
-        return True, f"connection file present ({path})"
-    return False, f"no connection file at {path}"
-
-
-def _check_ping(transport: str, home: str) -> tuple[bool, str]:
-    # Never trigger an interactive login from a diagnostic: on the app transport with
-    # no cached token, pinging would prompt (device code / browser), so skip it.
-    if transport == "app" and not _has_cached_token(home):
-        return False, "skipped: no cached login token — run blt-tunnel connect in a terminal"
-
-    module = _blt.get_blt()
-    ping = getattr(module, "ping", None)
-    if ping is None:
-        return False, "module has no ping()"
-    info = ping() or {}
-    who = info.get("user") or info.get("user_id") if isinstance(info, dict) else None
-    detail = "ping ok"
-    if who:
-        detail += f" (user {who})"
-    return True, detail
-
-
 def _check_space_schema() -> tuple[bool, str]:
     d = schema.get_digest()
     if isinstance(d, dict) and d.get("version"):
@@ -540,33 +481,93 @@ def _check_registration(project: str) -> tuple[bool, str]:
 
 
 def run_doctor(*, project: str | None = None, home: str | None = None, out=None) -> int:
-    """Run the diagnostics, print pass/fail, return 0 if all pass else 1."""
+    """Run the v3 diagnostics, print pass/fail, return 0 if all pass else 1.
+
+    Reports the located module (v3 bridge or real Runner), the bridge profile/token,
+    ``describe`` and ``space_schema``, plus pandas/mcp/registration. Never triggers an
+    interactive login — ``describe`` and ``space_schema`` are skipped (reported FAIL
+    with guidance) when a bridge is configured but there is no cached token, since a
+    connect would otherwise block on a device-code / browser prompt. On a real Runner
+    no connection is needed, so those checks report accordingly.
+    """
     out = out or sys.stdout
     project = os.path.abspath(project or os.getcwd())
     home = _resolve_home(home)
-    transport = _detect_transport()
+
+    try:
+        _blt.get_blt()
+        located = True
+    except Exception:  # noqa: BLE001 - a diagnostic must never crash
+        located = False
+    is_bridge = _bridge_version_safe() == 3
+    on_runner = located and not is_bridge  # real Runner module
+
+    bridge_profile = _bridge_profile_path(home)
+    have_profile = os.path.exists(bridge_profile) or bool(
+        os.environ.get("BALTHAZAR_BRIDGE_URL")
+    )
+    have_token = _has_cached_token(home)
+    _no_token = "skipped: no cached login token — run blt-tunnel connect in a terminal"
+
+    def c_module() -> tuple[bool, str]:
+        if not located:
+            return False, "could not locate a balthazar module (run: blt-tunnel connect)"
+        kind = "v3 reflection bridge" if is_bridge else "real Runner module"
+        return True, f"located balthazar ({kind})"
+
+    def c_bridge() -> tuple[bool, str]:
+        if is_bridge:
+            return True, "v3 reflection bridge (bridge_version=3)"
+        if on_runner:
+            return True, "running on a Runner (no bridge needed)"
+        return False, "no v3 bridge configured (run: blt-tunnel connect)"
+
+    def c_connection() -> tuple[bool, str]:
+        if on_runner:
+            return True, "running on a Runner; no connection file needed"
+        if not have_profile:
+            return False, f"no bridge profile at {bridge_profile} (run: blt-tunnel connect)"
+        if have_token:
+            return True, f"bridge profile present ({bridge_profile}); cached login token found"
+        return False, "bridge profile present but no cached login token (run: blt-tunnel connect)"
+
+    def c_describe() -> tuple[bool, str]:
+        if on_runner:
+            return True, "n/a on a Runner"
+        if not have_token:
+            return False, _no_token
+        desc = _blt.describe_info()
+        if not desc:
+            return False, "describe returned nothing"
+        return True, (
+            f"caller={desc.get('user')} owner={desc.get('owner')} "
+            f"shared={desc.get('shared')}"
+        )
+
+    def c_space_schema() -> tuple[bool, str]:
+        if not on_runner and not have_token:
+            return False, _no_token
+        return _check_space_schema()
 
     checks = [
-        _check("balthazar module", _check_module),
-        _check("transport", lambda: _check_transport(transport)),
-        _check("connection", lambda: _check_connection(home, transport)),
-        _check("ping", lambda: _check_ping(transport, home)),
-        _check("space_schema", _check_space_schema),
+        _check("balthazar module", c_module),
+        _check("bridge", c_bridge),
+        _check("connection", c_connection),
+        _check("describe", c_describe),
+        _check("space_schema", c_space_schema),
         _check("pandas", lambda: _check_import("pandas")),
         _check("mcp", _check_mcp),
         _check("registration", lambda: _check_registration(project)),
     ]
-
     for name, ok, detail in checks:
         print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}", file=out)
-
     all_ok = all(ok for _name, ok, _detail in checks)
     print(("all checks passed" if all_ok else "some checks failed"), file=out)
     return 0 if all_ok else 1
 
 
 # ---------------------------------------------------------------------------
-# blt-tunnel connect / disconnect (remote app tunnel, SPEC §7)
+# blt-tunnel connect / disconnect (v3 reflection bridge over the app tunnel)
 # ---------------------------------------------------------------------------
 
 
@@ -595,10 +596,10 @@ def run_connect(
     ca_file: str | None = None,
     out=None,
 ) -> int:
-    """Log in to a remote app tunnel and save the profile. Returns an exit code.
+    """Connect to the Balthazar app tunnel through the v3 bridge and save the profile.
 
-    Drives the shim's ``tunnel_connect`` (login + ping + profile write) and prints
-    who connected and which flow run. 0 on success, 1 on any failure.
+    Drives ``balthazar_remote.connect`` + ``save_profile`` and prints who connected
+    and the flow run. 0 on success, 1 on any failure (including a missing client).
     """
     out = out or sys.stdout
 
@@ -610,67 +611,101 @@ def run_connect(
         print("error: no password supplied", file=sys.stderr)
         return 1
 
-    try:
-        module = _blt.get_blt()
-    except Exception as exc:  # noqa: BLE001
-        print(f"error: could not load the balthazar shim: {exc}", file=sys.stderr)
-        return 1
-
-    connect = getattr(module, "tunnel_connect", None)
-    if connect is None:
+    remote_mod = _import_balthazar_remote()
+    if remote_mod is None:
         print(
-            "error: this balthazar shim has no tunnel_connect(...) — the app tunnel "
-            "needs the v2 session shim (session_tunnel/balthazar.py).",
+            "error: the v3 bridge client (bridge/balthazar_remote.py) is not "
+            "importable — cannot connect. Check $BLT_BRIDGE_DIR or the bridge/ dir.",
             file=sys.stderr,
         )
         return 1
+    return _run_connect_v3(
+        remote_mod, app_url, login=login, username=username,
+        password=password, site=site, ca_file=ca_file, out=out,
+    )
 
+
+def _run_connect_v3(
+    remote_mod, app_url, *, login, username, password, site, ca_file, out
+) -> int:
+    """Connect through the v3 bridge, save the profile, and print the describe summary.
+
+    ``connect`` itself enforces the protocol==3 handshake (it refuses otherwise), so a
+    successful return means ``describe`` is good. We then persist the profile and
+    report owner / caller / shared / flow run from the describe payload.
+    """
     try:
-        info = connect(
+        remote = remote_mod.connect(
             app_url,
+            site=site,
             login=login,
             username=username,
             password=password,
-            site=site,
             ca_file=ca_file,
+            interactive=True,
         )
-    except Exception as exc:  # noqa: BLE001 - surface any login/connection failure cleanly
+    except Exception as exc:  # noqa: BLE001 - LoginRequired/BridgeError/anything: clean 1
         print(f"error: could not connect: {exc}", file=sys.stderr)
         return 1
 
-    info = info if isinstance(info, dict) else {}
-    who = info.get("user") or info.get("user_id") or "?"
-    transport = info.get("transport") or "app"
-    run_id = info.get("flow_run_id") or "?"
-    flow_name = info.get("flow_name")
-    print(f"connected over the {transport} tunnel as user {who}", file=out)
-    tail = f" (flow {flow_name!r})" if flow_name else ""
-    print(f"flow run: {run_id}{tail}", file=out)
+    desc = _blt.describe_from_object(remote)
+    try:
+        remote_mod.save_profile(app_url, login, site=site, ca_file=ca_file)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: connected but could not save the profile: {exc}", file=sys.stderr)
+        return 1
+
+    owner = desc.get("owner", "?")
+    caller = desc.get("user", "?")
+    shared = desc.get("shared")
+    mode = "shared" if shared else "private" if shared is not None else "?"
+    run = _v3_run_ref(remote, desc)
+    print(
+        f"connected to the v3 bridge as {caller} "
+        f"(owner {owner}, {mode} mode)",
+        file=out,
+    )
+    print(f"flow run: {run}", file=out)
     return 0
 
 
-def run_disconnect(*, forget: bool = False, out=None) -> int:
-    """Remove the saved tunnel profile (and, with ``forget``, the cached token)."""
+def _v3_run_ref(remote, desc: dict) -> str:
+    """A flow-run identifier for the connect summary (describe first, then Remote)."""
+    for key in ("flow_run", "flow_run_id", "run_id", "run"):
+        value = desc.get(key)
+        if value:
+            return str(value)
+    for attr in ("flow_run_id", "flow_run"):
+        try:
+            value = getattr(remote, attr)
+        except Exception:  # noqa: BLE001
+            continue
+        if value:
+            return str(getattr(value, "id", value))
+    return "?"
+
+
+def run_disconnect(*, forget: bool = False, home: str | None = None, out=None) -> int:
+    """Remove the saved v3 bridge profile (and, with ``forget``, the cached token)."""
     out = out or sys.stdout
+    home = _resolve_home(home)
+    bridge_profile = _bridge_profile_path(home)
+    if not os.path.exists(bridge_profile):
+        print(f"no bridge profile to remove at {bridge_profile}", file=out)
+        return 0
     try:
-        module = _blt.get_blt()
-    except Exception as exc:  # noqa: BLE001
-        print(f"error: could not load the balthazar shim: {exc}", file=sys.stderr)
+        os.remove(bridge_profile)
+    except OSError as exc:
+        print(f"error: could not remove the bridge profile: {exc}", file=sys.stderr)
         return 1
-
-    disconnect = getattr(module, "tunnel_disconnect", None)
-    if disconnect is None:
-        print("error: this balthazar shim has no tunnel_disconnect(...)", file=sys.stderr)
-        return 1
-
-    try:
-        disconnect(forget=forget)
-    except Exception as exc:  # noqa: BLE001
-        print(f"error: could not disconnect: {exc}", file=sys.stderr)
-        return 1
-
+    if forget:
+        token = _token_cache_path(home)
+        try:
+            os.remove(token)
+        except OSError:
+            pass  # no token cached, or already gone
     extra = " and forgot the cached login token" if forget else ""
-    print(f"disconnected{extra}", file=out)
+    print(f"disconnected the v3 bridge{extra}", file=out)
     return 0
 
 
@@ -721,10 +756,11 @@ def _tunnel_parser() -> argparse.ArgumentParser:
     c.add_argument("--site", default=None, help="Balthazar site URL, if it can't be auto-discovered")
     c.add_argument("--ca-file", dest="ca_file", default=None, help="custom CA bundle (PEM file)")
 
-    x = sub.add_parser("disconnect", help="remove the saved app-tunnel profile")
+    x = sub.add_parser("disconnect", help="remove the saved v3 bridge profile")
     x.add_argument(
         "--forget", action="store_true", help="also delete the cached login/refresh token"
     )
+    x.add_argument("--home", default=None, help=argparse.SUPPRESS)
 
     return parser
 
@@ -768,7 +804,7 @@ def tunnel_main(argv: list[str] | None = None) -> int:
         )
 
     if args.command == "disconnect":
-        return run_disconnect(forget=args.forget)
+        return run_disconnect(forget=args.forget, home=args.home)
 
     _tunnel_parser().error("a subcommand is required")  # pragma: no cover
     return 2

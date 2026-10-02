@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "blt_analytics"
 version = "0.1.0"
-description = "Schema-only analytics tools over the Balthazar v2 session tunnel."
+description = "Schema-only analytics tools over the Balthazar v3 reflection bridge."
 readme = "README.md"
 requires-python = ">=3.10"
 # The core package is deliberately dependency-free: digest.py and _blt.py are
@@ -31,18 +31,16 @@ blt-schema-mcp = "blt_analytics.mcp_server:main"
 blt-tunnel = "blt_analytics.cli:tunnel_main"
 
 [tool.hatch.build.targets.wheel]
-# Flat layout: the package sits at the repo root next to the v1 shim, the flows
-# and the session_tunnel shim, so name it explicitly rather than letting
-# hatchling guess (and sweep those siblings in).
+# Flat layout: the package sits at the repo root next to the bridge/ and flows/
+# directories, so name it explicitly rather than letting hatchling guess (and
+# sweep those siblings in).
 packages = ["blt_analytics"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# importlib import-mode keeps pytest from prepending the repo root onto
-# sys.path, which is what would otherwise make a bare `import balthazar` resolve
-# to the v1 one-shot shim (balthazar.py) at the repo root. The fake balthazar is
-# injected explicitly via sys.modules in the `fake_blt` fixture instead.
-# pythonpath points at tests/ (not ".") so the fakes package is importable
-# without putting the v1 shim on the path.
+# importlib import-mode keeps pytest from prepending the repo root onto sys.path.
+# The fake balthazar is injected explicitly via sys.modules in the `fake_blt`
+# fixture instead. pythonpath points at tests/ (not ".") so the fakes package is
+# importable without disturbing how `import balthazar` resolves.
 addopts = "--import-mode=importlib"
 pythonpath = ["tests"]
