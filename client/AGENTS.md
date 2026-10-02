@@ -22,6 +22,16 @@ from connect import blt, ba
 - A 403 error means the user isn't allowed on this bridge. The same contact has to add
   them.
 
+## The other skills in this folder
+
+`balthazar-tunnel` and `balthazar-analytics` go deeper: run contexts, plots, device writes,
+DataFrame conventions and worked examples. Here they work with two differences:
+
+- Connect with `from connect import blt, ba` (above), never with `blt-tunnel connect`.
+- The schema tools (`overview`, `device_schema`, `find`, …), the MCP server and the
+  `blt-schema` / `blt-tunnel` commands are **not available** in this folder. Explore with
+  `blt.search_devices`, `blt.search_flows` and `ba.devices_df` instead, as shown below.
+
 ## Exploring the space
 
 ```python

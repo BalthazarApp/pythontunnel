@@ -11,6 +11,7 @@ cp blt_analytics/{__init__,_blt,_compat,cache,paging,frames}.py "$out/blt_analyt
 # The same instructions as a skill, where Claude Code, Cursor and Copilot find it on their own.
 for d in .claude/skills/balthazar .agents/skills/balthazar .github/skills/balthazar; do
   mkdir -p "$out/$d"
+  cp -R skills/balthazar-tunnel skills/balthazar-analytics "$out/$d/.."
   { printf -- '---\nname: balthazar\ndescription: Explore, analyse and plot the live Balthazar space (devices, flows, runs) from this folder. Use for any question about Balthazar data.\n---\n\n'; cat client/AGENTS.md; } > "$out/$d/SKILL.md"
 done
 find "$out" -name __pycache__ -prune -exec rm -rf {} +
