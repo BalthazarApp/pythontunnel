@@ -28,24 +28,37 @@ from __future__ import annotations
 
 import atexit
 import base64
+import datetime
 import hashlib
 import io
 import json
 import os
+import re
 import sys
 import threading
 import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Mapping
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 __all__ = [
     "enter_new_flow_run",
     "new_flow_run",
     "search_devices",
     "search_objects",
+    "search_flows",
+    "search_flow_run_history",
+    "fetch_visualizations",
+    "tunnel_space_schema",
+    "cached_devices",
+    "device_cache_status",
+    "refresh_device_cache",
+    "tunnel_cached_devices_query",
     "Device",
+    "Flow",
+    "FlowRun",
+    "Visualization",
     "output",
     "parent",
     "parents",
@@ -63,6 +76,11 @@ __balthazar_tunnel__ = True
 
 CONNECTION_FILE = os.path.expanduser("~/.balthazar_session_tunnel.json")
 _TIMEOUT_S = 300.0
+# Calls that may trigger a full device-cache load (250k+ devices) use a long timeout.
+_LOAD_TIMEOUT_S = 1800.0
+# Page size for transparently paging a whole-space cached_devices_query. Keeps each
+# response well under the request-body cap even for full §1 records.
+_QUERY_PAGE_SIZE = 10000
 _HEARTBEAT_INTERVAL_S = 30.0
 
 _CLIENT_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -107,6 +125,9 @@ def _connection() -> tuple[str, str]:
 
 
 def _call(op: str, **kwargs: Any) -> Any:
+    # ``_timeout`` is popped before serialization, so it never reaches the wire; it
+    # lets calls that may trigger a device-cache load wait far longer than a read.
+    timeout = kwargs.pop("_timeout", None) or _TIMEOUT_S
     url, token = _connection()
     kwargs.setdefault("client_id", _CLIENT_ID)
     body = json.dumps({"op": op, "kwargs": kwargs}).encode("utf-8")
@@ -115,7 +136,7 @@ def _call(op: str, **kwargs: Any) -> Any:
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:400]
@@ -216,7 +237,22 @@ def __getattr__(name: str) -> Any:
             "innermost open context, or blt.tunnel_state() for the server's own view "
             "of the context stack."
         )
+    # Dynamic per-index accessors: blt.get_wafer_devices("W123"). Generated only for
+    # the indexes the server advertises in ping, so an unknown index still raises
+    # AttributeError rather than silently returning a broken accessor.
+    match = _GET_INDEX_DEVICES_RE.match(name)
+    if match:
+        index_name = match.group("index")
+        if index_name in _advertised_indexes():
+            return _make_index_accessor(index_name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    """Include the dynamic ``get_<index>_devices`` accessors for tab-completion."""
+    names = set(globals()) | set(__all__)
+    names.update(f"get_{index}_devices" for index in _advertised_indexes())
+    return sorted(names)
 
 
 class _ReadOnlyMapping(Mapping):
@@ -405,14 +441,285 @@ def search_devices(
     limit: int = 0,
     offset: int = 0,
     archived: Optional[bool] = None,
+    keys: Optional[list[str]] = None,
+    scalars_only: bool = False,
+    include_params: bool = True,
 ) -> list[Device]:
-    """Search devices in the tunnel's context. Filters are ANDed; ``name`` globs."""
+    """Search devices in the tunnel's context. Filters are ANDed; ``name`` globs.
+
+    ``keys``, ``scalars_only`` and ``include_params`` are **shim-only** projection
+    kwargs — they trim what crosses the wire and have no counterpart on a real
+    Runner, so ``blt_analytics`` passes them only when it is talking to the tunnel
+    (``is_tunnel()``). ``keys`` keeps only those top-level param keys,
+    ``scalars_only`` drops dict/list param values, and ``include_params=False``
+    omits params entirely. Omitting all three returns the full device record,
+    exactly as before.
+    """
     payload = _call("search_devices", id=id, type=type, name=name, tags=tags,
-                    limit=limit, offset=offset, archived=archived)
+                    limit=limit, offset=offset, archived=archived,
+                    keys=keys, scalars_only=scalars_only, include_params=include_params)
     return [Device(item) for item in payload]
 
 
 search_objects = search_devices
+
+
+# ----------------------------------------------------------------------------
+# Read-only schema/history types and functions
+# ----------------------------------------------------------------------------
+
+
+def _parse_dt(value: Any) -> Any:
+    """Parse an ISO-8601 string back to a ``datetime``/``date``; pass else through.
+
+    A trailing ``Z`` is normalized to ``+00:00`` because ``fromisoformat`` rejects
+    it before Python 3.11. Anything that does not parse is returned unchanged.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            return datetime.date.fromisoformat(value)
+        except ValueError:
+            return value
+
+
+class Flow:
+    """Read-only local view of a ``balthazar.Flow`` (stub attribute names)."""
+
+    def __init__(self, record: dict[str, Any]):
+        self.id: str = record.get("id")
+        self.name: Optional[str] = record.get("name")
+        self.description: Optional[str] = record.get("description")
+        self.branch: Optional[str] = record.get("branch")
+        self.script_filename: Optional[str] = record.get("script_filename")
+        self.tags: list[str] = list(record.get("tags") or [])
+        self.created_time = _parse_dt(record.get("created_time"))
+        self.username: Optional[str] = record.get("username")
+        # {name: {type, default, description}}, straight from the wire.
+        self.parameters: dict[str, Any] = dict(record.get("parameters") or {})
+
+    def __repr__(self):
+        return f"<Flow {self.name!r} id={self.id}>"
+
+
+class FlowRun:
+    """Read-only local view of a flow run.
+
+    Mirrors the stub's attribute names, with two deliberate differences the tunnel
+    forces: ``device_ids`` (the run's devices are not fetched, only their ids) and
+    ``status`` as a plain string (the bare status name, e.g. ``"FINISHED"``).
+    """
+
+    def __init__(self, record: dict[str, Any]):
+        self.id: str = record.get("id")
+        self.flow_id: Optional[str] = record.get("flow_id")
+        self.flow_name: Optional[str] = record.get("flow_name")
+        self.name: Optional[str] = record.get("flow_name")
+        self.status: Optional[str] = record.get("status")
+        self.created_time = _parse_dt(record.get("created_time"))
+        self.started_time = _parse_dt(record.get("started_time"))
+        self.finished_time = _parse_dt(record.get("finished_time"))
+        self.username: Optional[str] = record.get("username")
+        self.tags: list[str] = list(record.get("tags") or [])
+        self.comment: Optional[str] = record.get("comment")
+        self.device_ids: list[str] = list(record.get("device_ids") or [])
+        self.params: dict[str, Any] = dict(record.get("params") or {})
+        self.output: dict[str, Any] = dict(record.get("output") or {})
+        self.visualization_ids: list[str] = list(record.get("visualization_ids") or [])
+
+    def __repr__(self):
+        return f"<FlowRun {self.id} flow={self.flow_name!r} status={self.status}>"
+
+
+class Visualization:
+    """Read-only local view of a visualization; ``.data`` is the decoded bytes."""
+
+    def __init__(self, record: dict[str, Any]):
+        self.id: str = record.get("id")
+        self.type = record.get("type")
+        self.filename: Optional[str] = record.get("filename")
+        self.flow_run_id: Optional[str] = record.get("flow_run_id")
+        self.timestamp = _parse_dt(record.get("timestamp"))
+        data_b64 = record.get("data_b64")
+        self.data: bytes = base64.b64decode(data_b64) if data_b64 else b""
+
+    def __repr__(self):
+        return f"<Visualization {self.id} {self.filename!r}>"
+
+
+def search_flows(
+    *,
+    name: Optional[str | list[str]] = None,
+    flow_ids: Optional[list[str]] = None,
+    tags: Optional[str | list[str]] = None,
+    limit: int = 1000,
+    offset: int = 0,
+) -> list[Flow]:
+    """Search flows in the tunnel's space. Filters are ANDed; ``name`` globs."""
+    payload = _call("search_flows", name=name, flow_ids=flow_ids, tags=tags,
+                    limit=limit, offset=offset)
+    return [Flow(item) for item in payload]
+
+
+def search_flow_run_history(
+    *,
+    flow_id: Optional[str] = None,
+    device_id: Optional[str] = None,
+    flow_run_ids: Optional[list[str]] = None,
+    limit: int = 250,
+    offset: int = 0,
+) -> list[FlowRun]:
+    """Search flow run history. Mirrors the real API name; returns ``FlowRun``s."""
+    payload = _call("search_flow_runs", flow_id=flow_id, device_id=device_id,
+                    flow_run_ids=flow_run_ids, limit=limit, offset=offset)
+    return [FlowRun(item) for item in payload]
+
+
+def fetch_visualizations(ids: Any) -> dict[str, Visualization]:
+    """Fetch visualizations by id as ``{id: Visualization}`` with decoded bytes.
+
+    The server caps a single call at 20 ids, so larger requests are batched into
+    chunks of 20 here and merged. A bare string id is accepted as a one-element
+    list.
+    """
+    if isinstance(ids, str):
+        ids = [ids]
+    ids = list(ids or [])
+    out: dict[str, Visualization] = {}
+    for start in range(0, len(ids), 20):
+        chunk = ids[start:start + 20]
+        for record in _call("fetch_visualizations", ids=chunk) or []:
+            viz = Visualization(record)
+            out[viz.id] = viz
+    return out
+
+
+def tunnel_space_schema(refresh: bool = False) -> dict[str, Any]:
+    """The server's measurement-free space digest (shim-only, hence the prefix).
+
+    Named ``tunnel_space_schema`` rather than ``space_schema`` because it has no
+    counterpart on a real Runner — it is the tunnel asking its host flow to build
+    the digest. ``refresh=True`` rebuilds it server-side rather than returning the
+    memoized copy.
+    """
+    return _call("space_schema", refresh=refresh)
+
+
+# ----------------------------------------------------------------------------
+# Server-side device cache (spec §6) — tunnel-only accessors
+# ----------------------------------------------------------------------------
+
+_GET_INDEX_DEVICES_RE = re.compile(r"^get_(?P<index>.+)_devices$")
+_advertised_indexes_cache: Optional[dict[str, str]] = None
+
+
+def _advertised_indexes() -> dict[str, str]:
+    """The server's configured device indexes ``{name: path}`` from ``ping``, cached.
+
+    Cached because it drives ``get_<index>_devices`` attribute resolution, which must
+    not hit the network on every miss. Call ``ping()`` again to refresh it.
+    """
+    global _advertised_indexes_cache
+    if _advertised_indexes_cache is None:
+        try:
+            info = _call("ping")
+            _root.update(info)
+            _advertised_indexes_cache = dict(info.get("device_indexes") or {})
+        except Exception:  # noqa: BLE001 - treat an unreachable tunnel as no indexes
+            _advertised_indexes_cache = {}
+    return _advertised_indexes_cache
+
+
+def _notice_if_loading() -> None:
+    """Print a one-line notice when the device cache is still loading or empty, so a
+    call that is about to block for a full load is not a silent hang."""
+    try:
+        status = _call("device_cache_status")
+    except Exception:  # noqa: BLE001 - the real call that follows will report it
+        return
+    if status.get("state") in ("loading", "empty"):
+        print("tunnel: loading device cache …", file=sys.stderr)
+
+
+def cached_devices(index: str, value: Any, *, refresh: bool = False) -> list[Device]:
+    """Tunnel-only: devices for one index value, served from the server's device cache.
+
+    Returns the shim's ``Device`` objects, so ``device.params.update(...)`` keeps
+    working. If the cache is cold this blocks while the server loads it (hence the long
+    timeout). ``refresh=True`` re-fetches that value's known device ids before serving
+    (picking up changes and dropping vanished devices); it cannot discover *newly
+    added* devices — use :func:`refresh_device_cache` for that. Does not exist on a
+    real Runner.
+    """
+    _notice_if_loading()
+    payload = _call("cached_devices", _timeout=_LOAD_TIMEOUT_S,
+                    index=index, value=value, refresh=refresh)
+    return [Device(item) for item in payload]
+
+
+def device_cache_status() -> dict[str, Any]:
+    """Tunnel-only: the server's device-cache status (state, counts, indexes, path)."""
+    return _call("device_cache_status")
+
+
+def refresh_device_cache(wait: bool = True) -> dict[str, Any]:
+    """Tunnel-only: trigger a full device-cache reload on the server.
+
+    ``wait=True`` (default) blocks until the reload finishes and returns the resulting
+    status; ``wait=False`` kicks it off in the background and returns immediately. The
+    reload replaces the cache atomically on success and keeps the old one on failure.
+    """
+    _notice_if_loading()
+    return _call("refresh_device_cache", _timeout=_LOAD_TIMEOUT_S, wait=wait)
+
+
+def tunnel_cached_devices_query(
+    device_type: Optional[str | list[str]] = None,
+    keys: Optional[list[str]] = None,
+) -> list[Device]:
+    """Tunnel-only: every cached device record, optionally type-filtered and projected.
+
+    Lets whole-space frames avoid paging ``search_devices``. A full pull would make a
+    response far larger than the request cap, so this pages the query transparently
+    (the server takes ``offset``/``limit``) and returns the concatenated ``Device``
+    list. ``keys`` keeps only those top-level param keys. Does not exist on a real
+    Runner, hence the ``tunnel_`` prefix.
+    """
+    _notice_if_loading()
+    out: list[Device] = []
+    offset = 0
+    while True:
+        payload = _call("cached_devices_query", _timeout=_LOAD_TIMEOUT_S,
+                        device_type=device_type, keys=keys,
+                        offset=offset, limit=_QUERY_PAGE_SIZE)
+        records = payload["devices"]
+        out.extend(Device(item) for item in records)
+        total = payload.get("total", len(out))
+        offset += len(records)
+        if not records or offset >= total or len(records) < _QUERY_PAGE_SIZE:
+            break
+    return out
+
+
+def _make_index_accessor(index_name: str) -> Callable[..., list[Device]]:
+    """Build a ``get_<index>_devices(value, *, refresh=False)`` accessor."""
+
+    def accessor(value: Any, *, refresh: bool = False) -> list[Device]:
+        return cached_devices(index_name, value, refresh=refresh)
+
+    accessor.__name__ = f"get_{index_name}_devices"
+    accessor.__qualname__ = accessor.__name__
+    accessor.__doc__ = (
+        f"Tunnel-only: devices whose '{index_name}' index matches ``value``, from the "
+        f"server's device cache (equivalent to ``blt.cached_devices({index_name!r}, "
+        f"value)``). This accessor is generated from the tunnel's configured indexes "
+        f"and does NOT exist on a real Runner."
+    )
+    return accessor
 
 
 # ----------------------------------------------------------------------------
