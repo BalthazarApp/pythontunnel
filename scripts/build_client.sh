@@ -14,6 +14,8 @@ for d in .claude/skills/balthazar .agents/skills/balthazar .github/skills/baltha
   cp -R skills/balthazar-tunnel skills/balthazar-analytics "$out/$d/.."
   { printf -- '---\nname: balthazar\ndescription: Explore, analyse and plot the live Balthazar space (devices, flows, runs) from this folder. Use for any question about Balthazar data.\n---\n\n'; cat client/AGENTS.md; } > "$out/$d/SKILL.md"
 done
+# Copilot reads this file on every chat, also in versions without skill support.
+cp client/AGENTS.md "$out/.github/copilot-instructions.md"
 find "$out" -name __pycache__ -prune -exec rm -rf {} +
 (cd dist && zip -qr balthazar-client.zip balthazar-client -x "*.DS_Store")
 echo "built dist/balthazar-client.zip — fill in dist/balthazar-client/bridge_url.txt before sending"

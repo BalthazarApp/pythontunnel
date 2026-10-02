@@ -2,7 +2,8 @@
 
 1. Install Python 3.10 or newer, then run in this folder:
    `pip install pandas matplotlib`
-2. Open this folder in Claude Code, Cursor or VS Code with Copilot.
+2. Open this folder in VS Code and open Copilot Chat in **Agent** mode (Claude Code and Cursor
+   work too).
 3. Ask a question, for example: *"Which device types are there? Plot yield per lot."*
 
 The first time, a browser window opens to sign in to Balthazar.
