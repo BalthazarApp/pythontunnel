@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blt_analytics"
+version = "0.1.0"
+description = "Schema-only analytics tools over the Balthazar v2 session tunnel."
+readme = "README.md"
+requires-python = ">=3.10"
+# The core package is deliberately dependency-free: digest.py and _blt.py are
+# stdlib-only so that `import blt_analytics` (and the schema tools that lean on
+# it) work on a bare interpreter. Pandas/matplotlib/mcp live behind extras and
+# are imported lazily, never at package import time.
+dependencies = []
+
+[project.optional-dependencies]
+analytics = ["pandas", "numpy", "matplotlib"]
+mcp = ["mcp"]
+dev = ["pytest"]
+# `all` pulls in every optional group via a self-reference, so there is one
+# obvious "install everything" target for the editable dev install.
+all = ["blt_analytics[analytics,mcp,dev]"]
+
+[project.scripts]
+# These entry points reference modules owned by the Tools agent (cli, mcp_server).
+# They need not exist for the install to succeed — a console script is only
+# resolved when it is invoked.
+blt-schema = "blt_analytics.cli:schema_main"
+blt-schema-mcp = "blt_analytics.mcp_server:main"
+blt-tunnel = "blt_analytics.cli:tunnel_main"
+
+[tool.hatch.build.targets.wheel]
+# Flat layout: the package sits at the repo root next to the v1 shim, the flows
+# and the session_tunnel shim, so name it explicitly rather than letting
+# hatchling guess (and sweep those siblings in).
+packages = ["blt_analytics"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# importlib import-mode keeps pytest from prepending the repo root onto
+# sys.path, which is what would otherwise make a bare `import balthazar` resolve
+# to the v1 one-shot shim (balthazar.py) at the repo root. The fake balthazar is
+# injected explicitly via sys.modules in the `fake_blt` fixture instead.
+# pythonpath points at tests/ (not ".") so the fakes package is importable
+# without putting the v1 shim on the path.
+addopts = "--import-mode=importlib"
+pythonpath = ["tests"]
